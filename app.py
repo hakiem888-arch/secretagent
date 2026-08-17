@@ -3,7 +3,7 @@ import os, requests, pandas as pd, streamlit as st
 import plotly.graph_objects as go
 from langchain_groq import ChatGroq
 
-st.set_page_config(page_title="AI Consensus Trading V4", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="AI Consensus Trading V4.2", page_icon="🧠", layout="wide")
 BINANCE="https://data-api.binance.vision"
 
 def secret(k):
@@ -17,8 +17,23 @@ TG_TOKEN=secret("TELEGRAM_BOT_TOKEN")
 TG_CHAT=secret("TELEGRAM_CHAT_ID")
 
 def bget(path, params=None):
-    r=requests.get(BINANCE+path, params=params, timeout=15)
-    r.raise_for_status()
+    """Binance public market-data request. Tidak membutuhkan API key."""
+    r = requests.get(
+        BINANCE + path,
+        params=params,
+        timeout=15,
+        headers={
+            "User-Agent": "AI-Consensus-Trading-V4.2",
+            "Accept": "application/json",
+        },
+    )
+
+    if r.status_code != 200:
+        detail = r.text[:500].replace("\n", " ")
+        raise RuntimeError(
+            f"Binance HTTP {r.status_code}: {detail}"
+        )
+
     return r.json()
 
 def ema(s,n): return s.ewm(span=n,adjust=False).mean()
@@ -229,28 +244,54 @@ SCORE: {score}/100
 
 ⚠️ Analisis eksperimental, bukan jaminan profit."""
 
+def binance_health():
+    """Tes endpoint public market-data sebelum scanner dijalankan."""
+    try:
+        data = bget("/api/v3/ping")
+        # /ping biasanya mengembalikan {}.
+        return True, "Binance public data API ONLINE"
+    except Exception as e:
+        return False, str(e)
+
 if "scan" not in st.session_state: st.session_state.scan=[]
 if "sent" not in st.session_state: st.session_state.sent=set()
 
-st.title("🧠 AI Consensus Trading V4")
-st.caption("Scanner → Volume & Order Flow → 4 AI → Risk Gate → AI Judge → Telegram")
+st.title("🧠 AI Consensus Trading V4.2")
+st.caption("Binance Public Data → Scanner → Volume & Order Flow → 4 AI → Risk Gate → AI Judge → Telegram")
 st.sidebar.header("🔎 Scanner")
 scan_n=st.sidebar.slider("Koin yang discan",20,100,60)
 top_n=st.sidebar.slider("Kandidat dianalisis AI",1,5,3)
 scan_btn=st.sidebar.button("🔍 SCAN MARKET",use_container_width=True)
 st.sidebar.divider()
 st.sidebar.write("Groq:", "✅ SIAP" if GROQ_KEY else "❌ BELUM ADA")
+st.sidebar.write("Market Data:", "🟢 Binance Public API")
+st.sidebar.caption("Endpoint: data-api.binance.vision")
 st.sidebar.header("📱 Telegram")
 tg_on=st.sidebar.checkbox("Kirim alert Telegram",bool(TG_TOKEN and TG_CHAT))
+if not TG_TOKEN or not TG_CHAT:
+    st.sidebar.caption("Telegram belum dikonfigurasi — scanner tetap bisa dipakai.")
 min_score=st.sidebar.slider("Minimum skor alert",40,100,75)
 if st.sidebar.button("📨 Test Telegram",use_container_width=True):
     ok,msg=telegram("✅ TEST AI CONSENSUS TRADING V4\nTelegram berhasil terhubung.")
     st.sidebar.success(msg) if ok else st.sidebar.error(msg)
 
 if scan_btn:
-    with st.spinner("🛰️ Mencari koin dengan volume, momentum dan order flow kuat..."):
-        try: st.session_state.scan=scan(scan_n)
-        except Exception as e: st.error(f"Scanner gagal: {e}")
+    ok, status = binance_health()
+
+    if not ok:
+        st.error(
+            "❌ Binance Public Market Data tidak dapat diakses dari environment Streamlit. "
+            f"Detail: {status}"
+        )
+        st.info(
+            "Groq Secret tidak terkait dengan error ini. Scanner berhenti sebelum memanggil AI."
+        )
+    else:
+        with st.spinner("🛰️ Mencari koin dengan volume, momentum dan order flow kuat..."):
+            try:
+                st.session_state.scan=scan(scan_n)
+            except Exception as e:
+                st.error(f"Scanner gagal: {e}")
 
 if not st.session_state.scan:
     st.info("Klik SCAN MARKET untuk memulai.")
@@ -311,4 +352,4 @@ for rank,c in enumerate(st.session_state.scan[:top_n],1):
             else: st.error(f"Telegram gagal: {msg}")
     st.divider()
 
-st.caption("V4 hanya melakukan scanning dan analisis; tidak mengeksekusi order otomatis. Sinyal bersifat eksperimental dan bukan jaminan profit.")
+st.caption("V4.2 memakai Binance public market data. Buy Pressure memakai taker-buy quote volume dari Kline; tidak ada eksekusi order otomatis. Sinyal bersifat eksperimental dan bukan jaminan profit.")
