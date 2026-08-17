@@ -4,7 +4,7 @@ import plotly.graph_objects as go
 from langchain_groq import ChatGroq
 
 st.set_page_config(page_title="AI Consensus Trading V4", page_icon="🧠", layout="wide")
-BINANCE="https://api.binance.com"
+BINANCE="https://data-api.binance.vision"
 
 def secret(k):
     try:
