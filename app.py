@@ -3,38 +3,23 @@ import os, requests, pandas as pd, streamlit as st
 import plotly.graph_objects as go
 from langchain_groq import ChatGroq
 
-st.set_page_config(page_title="AI Consensus Trading V4.1", page_icon="🧠", layout="wide")
-BYBIT="https://api.bybit.com"
-BYBIT_CATEGORY="linear"  # public USDT perpetual market data
+st.set_page_config(page_title="AI Consensus Trading V4", page_icon="🧠", layout="wide")
+BINANCE="https://data-api.binance.vision"
 
 def secret(k):
     try:
-        if k in st.secrets:
-            return st.secrets[k]
-    except Exception:
-        pass
-    return os.getenv(k, "")
+        if k in st.secrets: return st.secrets[k]
+    except Exception: pass
+    return os.getenv(k,"")
 
 GROQ_KEY=secret("GROQ_API_KEY")
 TG_TOKEN=secret("TELEGRAM_BOT_TOKEN")
 TG_CHAT=secret("TELEGRAM_CHAT_ID")
 
 def bget(path, params=None):
-    """Bybit V5 public market-data request; no API key required."""
-    r=requests.get(
-        BYBIT+path,
-        params=params,
-        timeout=15,
-        headers={"User-Agent":"AI-Consensus-Trading-V4/1.0"}
-    )
-    if r.status_code != 200:
-        raise RuntimeError(f"Bybit HTTP {r.status_code}: {r.text[:300]}")
-    data=r.json()
-    if data.get("retCode") != 0:
-        raise RuntimeError(
-            f"Bybit {data.get('retCode')}: {data.get('retMsg')}"
-        )
-    return data["result"]
+    r=requests.get(BINANCE+path, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()
 
 def ema(s,n): return s.ewm(span=n,adjust=False).mean()
 def rsi(s,n=14):
