@@ -449,7 +449,7 @@ def scan_markets(n=60):
 # - Short decision packets keep token usage under control.
 ANALYST_MODEL = secret("ANALYST_MODEL") or "openai/gpt-oss-20b"
 DEBATE_MODEL = secret("DEBATE_MODEL") or "openai/gpt-oss-20b"
-DEBATE_FALLBACK_MODEL = secret("DEBATE_FALLBACK_MODEL") or "llama-3.1-8b-instant"
+DEBATE_FALLBACK_MODEL = secret("DEBATE_FALLBACK_MODEL") or "openai/gpt-oss-20b"
 RESEARCH_MODEL = secret("RESEARCH_MODEL") or "openai/gpt-oss-120b"
 JUDGE_MODEL = secret("JUDGE_MODEL") or "openai/gpt-oss-120b"
 
@@ -699,53 +699,7 @@ DATA:
 """
 
 def _request_groq(tier, prompt, api_key=None):
-    client = groq_client(api_key)
-    if not client:
-        raise RuntimeError("GROQ_API_KEY belum dikonfigurasi.")
-
-    cfg = MODEL_TIERS[tier]
-    model_name = cfg["model"]
-
-    kwargs = {
-        "model": model_name,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
-        "temperature": 0.1,
-        "max_completion_tokens": cfg["max_tokens"],
-    }
-
-    # IMPORTANT:
-    # reasoning_effort is NOT placed in model_kwargs and is NOT sent to
-    # non-GPT-OSS models. This fixes the previous 400 validation errors.
-    if is_gpt_oss(model_name):
-        kwargs["reasoning_effort"] = cfg["reasoning_effort"]
-        kwargs["reasoning_format"] = "hidden"
-
-    # GPT-OSS 20B/120B support strict JSON Schema. This prevents the
-    # "Unterminated string" / malformed JSON problem seen in Research Manager.
-    # Prefer strict JSON Schema for GPT-OSS, but call_ai() has a fallback to
-    # JSON Object Mode if Groq rejects the generated schema/output. This makes
-    # the app resilient to SDK/model-side validation changes.
-    if cfg["structured"] and is_gpt_oss(model_name):
-        kwargs["response_format"] = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "trading_agent_decision",
-                "strict": True,
-                "schema": AI_SCHEMA,
-            },
-        }
-    else:
-        kwargs["response_format"] = {"type": "json_object"}
-
-    return client.chat.completions.create(**kwargs)
-
-
-def _request_groq_json_object(tier, prompt, api_key=None):
+    """Reliable Groq request using JSON Object Mode for all models."""
     client = groq_client(api_key)
     if not client:
         raise RuntimeError("GROQ_API_KEY belum dikonfigurasi.")
@@ -753,13 +707,13 @@ def _request_groq_json_object(tier, prompt, api_key=None):
     model_name = cfg["model"]
     kwargs = {
         "model": model_name,
-        "messages": [{"role":"user", "content":prompt}],
+        "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
         "max_completion_tokens": cfg["max_tokens"],
-        "response_format": {"type":"json_object"},
+        "response_format": {"type": "json_object"},
     }
     if is_gpt_oss(model_name):
-        kwargs["reasoning_effort"] = cfg["reasoning_effort"]
+        kwargs["reasoning_effort"] = cfg["reasoning_effort"] or "low"
         kwargs["reasoning_format"] = "hidden"
     return client.chat.completions.create(**kwargs)
 
@@ -794,10 +748,9 @@ def call_ai(role, data, instructions, tier="analyst", budget=None):
     # Try configured model first. If the model is unavailable to a key/project,
     # continue with other keys, then use the tier fallback model.
     models_to_try = [cfg_for_call["model"]]
-    if tier == "debate" and DEBATE_FALLBACK_MODEL not in models_to_try:
-        models_to_try.append(DEBATE_FALLBACK_MODEL)
-    if "openai/gpt-oss-20b" not in models_to_try:
-        models_to_try.append("openai/gpt-oss-20b")
+    fallback = DEBATE_FALLBACK_MODEL if tier == "debate" else "openai/gpt-oss-20b"
+    if fallback and fallback not in models_to_try:
+        models_to_try.append(fallback)
 
     try:
         active = int(st.session_state.get("_groq_active_key", 0)) % len(GROQ_KEYS)
@@ -850,27 +803,15 @@ def call_ai(role, data, instructions, tier="analyst", budget=None):
                         # This can be key/project-specific. Try the next key.
                         continue
 
-                    if _is_json_validation_error(msg) and is_gpt_oss(model_name):
-                        # Strict JSON Schema failed. Retry this same key/model in
-                        # plain JSON Object Mode instead of killing the whole agent.
-                        try:
-                            response = _request_groq_json_object(tier, prompt, api_key=key)
-                            st.session_state["_last_ai_call"] = time.time()
-                            st.session_state["_groq_active_key"] = key_index
-                            obj = _safe_json_from_text(response.choices[0].message.content or "")
-                            return _normalize_ai(obj, tier)
-                        except Exception as e2:
-                            errors.append(f"{_key_mask(key)} / json_object: {str(e2)[:220]}")
-                            continue
-
                     # Non-transient 400 errors are model/request errors. Try the
                     # next model rather than repeating the exact same request.
                     model_failed_for_all_keys = False
                     break
 
-            # If every key failed because the model isn't accessible, try fallback.
-            if model_failed_for_all_keys or errors:
+            # Try fallback only when every attempt reported model access/not-found.
+            if model_failed_for_all_keys:
                 continue
+            break
 
         raise RuntimeError("Semua API key/model gagal. " + " | ".join(errors[-6:]))
 
