@@ -2,6 +2,7 @@ import os
 import json
 import math
 import sqlite3
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -53,7 +54,6 @@ def secret(key):
 GROQ_KEY = secret("GROQ_API_KEY")
 TG_TOKEN = secret("TELEGRAM_BOT_TOKEN")
 TG_CHAT = secret("TELEGRAM_CHAT_ID")
-GROQ_MODEL = secret("GROQ_MODEL") or "openai/gpt-oss-120b"
 
 # -------------------------
 # Database
@@ -416,80 +416,135 @@ def scan_markets(n=60):
     )
 
 # -------------------------
-# AI engine
+# AI engine — V5.1 Token-Efficient Multi-Model
 # -------------------------
-def model():
+# Setiap tingkat memakai model sesuai tingkat reasoning yang dibutuhkan.
+# Model dan token budget bisa diganti lewat Streamlit Secrets tanpa mengubah kode.
+ANALYST_MODEL = secret("ANALYST_MODEL") or "openai/gpt-oss-20b"
+DEBATE_MODEL = secret("DEBATE_MODEL") or "groq/compound"
+RESEARCH_MODEL = secret("RESEARCH_MODEL") or "openai/gpt-oss-120b"
+JUDGE_MODEL = secret("JUDGE_MODEL") or "openai/gpt-oss-120b"
+
+ANALYST_MAX_TOKENS = int(secret("ANALYST_MAX_TOKENS") or 260)
+DEBATE_MAX_TOKENS = int(secret("DEBATE_MAX_TOKENS") or 360)
+RESEARCH_MAX_TOKENS = int(secret("RESEARCH_MAX_TOKENS") or 480)
+JUDGE_MAX_TOKENS = int(secret("JUDGE_MAX_TOKENS") or 420)
+
+# Batas panggilan AI per kandidat. Ini proteksi tambahan terhadap rate-limit.
+MAX_AI_CALLS_PER_CANDIDATE = int(secret("MAX_AI_CALLS_PER_CANDIDATE") or 12)
+GROQ_MIN_DELAY = float(secret("GROQ_MIN_DELAY") or 1.0)
+
+MODEL_TIERS = {
+    "analyst": (ANALYST_MODEL, ANALYST_MAX_TOKENS, "low"),
+    "debate": (DEBATE_MODEL, DEBATE_MAX_TOKENS, "low"),
+    "research": (RESEARCH_MODEL, RESEARCH_MAX_TOKENS, "medium"),
+    "judge": (JUDGE_MODEL, JUDGE_MAX_TOKENS, "high"),
+}
+
+
+def model_for(tier):
     if not GROQ_KEY:
         return None
-
+    model_name, max_tokens, reasoning_effort = MODEL_TIERS[tier]
     return ChatGroq(
         api_key=GROQ_KEY,
-        model=GROQ_MODEL,
+        model=model_name,
         temperature=0.1,
+        max_tokens=max_tokens,
+        model_kwargs={"reasoning_effort": reasoning_effort},
     )
 
-def call_ai(role, data, instructions):
-    m = model()
+
+def compact_json(obj):
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def call_ai(role, data, instructions, tier="analyst", budget=None):
+    """Satu agent = satu tugas. Output sengaja pendek dan terstruktur."""
+    m = model_for(tier)
 
     if not m:
         return {
             "decision": "WAIT",
             "confidence": 0,
             "reasoning": "GROQ_API_KEY belum dikonfigurasi.",
+            "key_risk": "AI tidak tersedia.",
         }
 
+    max_out = budget or MODEL_TIERS[tier][1]
     prompt = f"""
-Kamu adalah {role} dalam sebuah ruang riset trading profesional.
+Kamu adalah {role} dalam sistem riset trading multi-agent.
 
-ATURAN KERAS:
-- Gunakan HANYA data yang diberikan.
-- Jangan mengarang data, berita, harga, volume, atau indikator.
+PERANMU HANYA: {instructions}
+
+ATURAN:
+- Gunakan hanya data yang diberikan.
+- Jangan mengarang harga, berita, volume, indikator, atau fakta eksternal.
 - Jangan menjanjikan profit.
 - Jika bukti tidak cukup, pilih WAIT.
-- Jawaban wajib Bahasa Indonesia.
-- Kamu adalah satu agen, bukan hakim final.
+- Jawab Bahasa Indonesia.
+- Jangan mengambil alih tugas agent lain.
+- Jawaban SANGAT SINGKAT, maksimal sekitar 3 poin bukti.
 
-DATA MARKET:
+DATA:
 {data}
 
-TUGAS KHUSUS:
-{instructions}
-
-Balas dalam format JSON SAJA:
+Balas JSON SAJA:
 {{
-  "decision": "LONG atau SHORT atau WAIT",
-  "confidence": 0-100,
-  "reasoning": "alasan singkat",
-  "key_risk": "risiko utama"
+  "decision":"LONG|SHORT|WAIT",
+  "confidence":0,
+  "reasoning":"maksimal 2 kalimat",
+  "key_risk":"maksimal 1 kalimat",
+  "evidence":["maksimal 3 bukti singkat"]
 }}
 """
 
     try:
-        raw = m.invoke(prompt).content.strip()
+        # Pacing mengurangi burst request pada akun dengan TPM/RPM kecil.
+        last_call = st.session_state.get("_last_ai_call", 0.0)
+        wait = GROQ_MIN_DELAY - (time.time() - last_call)
+        if wait > 0:
+            time.sleep(wait)
 
-        # Cari blok JSON jika model menambahkan markdown.
+        try:
+            response = m.invoke(prompt)
+        except Exception as first_error:
+            # Jika Groq mengembalikan 429, tunggu sebentar lalu retry sekali.
+            if "429" in str(first_error) or "rate_limit" in str(first_error).lower():
+                time.sleep(float(secret("GROQ_RETRY_SECONDS") or 15))
+                response = m.invoke(prompt)
+            else:
+                raise
+
+        st.session_state["_last_ai_call"] = time.time()
+        raw = response.content.strip()
         if "{" in raw and "}" in raw:
             raw = raw[raw.find("{"):raw.rfind("}") + 1]
-
         obj = json.loads(raw)
-
         decision = str(obj.get("decision", "WAIT")).upper()
         if decision not in {"LONG", "SHORT", "WAIT"}:
             decision = "WAIT"
-
+        evidence = obj.get("evidence", [])
+        if not isinstance(evidence, list):
+            evidence = [str(evidence)] if evidence else []
         return {
             "decision": decision,
-            "confidence": float(obj.get("confidence", 0) or 0),
-            "reasoning": str(obj.get("reasoning", "")),
-            "key_risk": str(obj.get("key_risk", "")),
+            "confidence": max(0.0, min(100.0, float(obj.get("confidence", 0) or 0))),
+            "reasoning": str(obj.get("reasoning", ""))[:500],
+            "key_risk": str(obj.get("key_risk", ""))[:300],
+            "evidence": [str(x)[:180] for x in evidence[:3]],
+            "tier": tier,
+            "model": MODEL_TIERS[tier][0],
         }
-
     except Exception as e:
         return {
             "decision": "WAIT",
             "confidence": 0,
-            "reasoning": f"AI tidak dapat menghasilkan output terstruktur: {e}",
+            "reasoning": f"AI gagal menghasilkan JSON: {e}",
             "key_risk": "Output AI gagal diproses.",
+            "evidence": [],
+            "tier": tier,
+            "model": MODEL_TIERS[tier][0],
         }
 
 # -------------------------
@@ -579,212 +634,171 @@ def packet_text(packet):
     return "\n".join(lines)
 
 # -------------------------
-# TradingAgents-style orchestration
+# V5.1 Token-Efficient orchestration
 # -------------------------
 ANALYSTS = [
-    (
-        "🧭 Technical Analyst",
-        "Fokus trend multi-timeframe, EMA20/50/200, MACD, support/resistance, dan market regime."
-    ),
-    (
-        "⚡ Momentum Analyst",
-        "Fokus momentum, RSI, volume ratio, taker-buy pressure, acceleration, dan konfirmasi 5m/15m/1h."
-    ),
-    (
-        "📚 Order Flow Analyst",
-        "Fokus order-book imbalance, spread, liquidity, taker-buy pressure, dan apakah pergerakan didukung flow."
-    ),
-    (
-        "🕯️ Price Action Analyst",
-        "Fokus candlestick, wick, rejection, breakout, support/resistance, dan struktur harga."
-    ),
+    ("🧭 Technical Analyst", "Fokus trend multi-timeframe, EMA, MACD, support/resistance, dan regime."),
+    ("⚡ Momentum Analyst", "Fokus RSI, volume ratio, taker-buy pressure, momentum, dan konfirmasi timeframe."),
+    ("📚 Order Flow Analyst", "Fokus order-book imbalance, spread, liquidity, dan tekanan beli/jual."),
+    ("🕯️ Price Action Analyst", "Fokus candle, wick, rejection, breakout, struktur harga, support/resistance."),
 ]
+
+
+def analyst_summary_text(items):
+    lines = []
+    for x in items:
+        lines.append(
+            f"{x['agent']} | {x['decision']} | C={x['confidence']:.0f} | "
+            f"Bukti={'; '.join(x.get('evidence', []))} | Risiko={x['key_risk']}"
+        )
+    return "\n".join(lines)
+
+
+def debate_summary_text(bull, bear):
+    return (
+        f"BULL: {bull['decision']} C={bull['confidence']:.0f}; "
+        f"{bull['reasoning']}; bukti={'; '.join(bull.get('evidence', []))}; risiko={bull['key_risk']}\n"
+        f"BEAR: {bear['decision']} C={bear['confidence']:.0f}; "
+        f"{bear['reasoning']}; bukti={'; '.join(bear.get('evidence', []))}; risiko={bear['key_risk']}"
+    )
+
+
+def risk_summary_text(items):
+    return "\n".join(
+        f"{x['agent']} | {x['decision']} | C={x['confidence']:.0f} | "
+        f"{x['reasoning']} | risiko={x['key_risk']}"
+        for x in items
+    )
+
 
 def run_multi_agent(symbol, scanner_score_value):
     frames, packet = market_packet(symbol)
     data = packet_text(packet)
 
+    # 1) Four analyst ringan. Mereka tidak melihat output agent lain dan tidak menjadi hakim.
     analyst_results = []
-
     for name, rule in ANALYSTS:
-        result = call_ai(
-            name,
-            data,
-            rule + (
-                "\nJangan membuat keputusan final portfolio. "
-                "Berikan thesis yang bisa diserang oleh Bull dan Bear researcher."
-            ),
-        )
         analyst_results.append({
             "agent": name,
-            **result,
+            **call_ai(
+                name,
+                data,
+                rule + " Berikan thesis mandiri untuk diteruskan ke Bull dan Bear.",
+                tier="analyst",
+            ),
         })
 
-    analyst_summary = "\n\n".join(
-        f"{x['agent']}\n"
-        f"Decision={x['decision']}\n"
-        f"Confidence={x['confidence']:.0f}\n"
-        f"Reasoning={x['reasoning']}\n"
-        f"Risk={x['key_risk']}"
-        for x in analyst_results
-    )
+    analyst_summary = analyst_summary_text(analyst_results)
 
+    # 2) Debat: model menengah. Keduanya menerima ringkasan yang sama agar debat fair.
+    debate_data = data + "\n\nRINGKASAN ANALYST:\n" + analyst_summary
     bull = call_ai(
         "🐂 Bull Researcher",
-        data + "\n\nHASIL ANALYST:\n" + analyst_summary,
-        """
-Bangun kasus paling kuat untuk LONG.
-Kamu harus menyerang kelemahan argumen bearish dan menunjukkan bukti
-yang mendukung kenaikan. Jangan mengabaikan risiko.
-Jika data tidak cukup, kamu boleh WAIT.
-""",
+        debate_data,
+        "Bangun kasus LONG paling kuat. Serang kelemahan skenario bearish, tetapi akui risiko dan kondisi invalidasi.",
+        tier="debate",
     )
-
     bear = call_ai(
         "🐻 Bear Researcher",
-        data + "\n\nHASIL ANALYST:\n" + analyst_summary,
-        """
-Bangun kasus paling kuat untuk SHORT atau WAIT.
-Cari overextension, resistance, volume yang tidak sehat,
-order-flow yang berlawanan, dan risiko false breakout.
-Serang argumen Bull secara spesifik.
-""",
+        debate_data,
+        "Bangun kasus SHORT/WAIT paling kuat. Serang kelemahan Bull dengan resistance, overextension, flow berlawanan, dan false breakout.",
+        tier="debate",
     )
+    debate = debate_summary_text(bull, bear)
 
-    debate = (
-        f"BULL RESEARCHER:\n{json.dumps(bull, ensure_ascii=False)}\n\n"
-        f"BEAR RESEARCHER:\n{json.dumps(bear, ensure_ascii=False)}"
+    # 3) Research Manager kuat. Hanya menerima ringkasan, bukan transcript panjang.
+    research_input = (
+        data
+        + "\n\nANALYST SUMMARY:\n" + analyst_summary
+        + "\n\nBULL vs BEAR:\n" + debate
     )
-
     research_manager = call_ai(
         "🧠 Research Manager",
-        data + "\n\nANALYST TEAM:\n" + analyst_summary + "\n\nDEBAT:\n" + debate,
-        """
-Nilai kualitas bukti dari seluruh analyst dan debat Bull vs Bear.
-Tentukan thesis riset yang paling masuk akal.
-Jangan menjadi portfolio manager. Fokus pada kualitas bukti,
-kontradiksi, dan kondisi yang harus dipenuhi sebelum entry.
-""",
+        research_input,
+        "Sintesis bukti terbaik. Nilai konflik timeframe, kualitas Bull vs Bear, dan tetapkan thesis riset serta kondisi yang wajib terpenuhi sebelum entry.",
+        tier="research",
     )
 
+    # 4) Trader tidak perlu model besar. Buat rencana dari research summary.
+    trader_input = (
+        f"Market: {packet['symbol']} price={packet['price']:.8f}, ATR15={packet['timeframes']['15m']['atr']:.8f}, "
+        f"support={packet['support']:.8f}, resistance={packet['resistance']:.8f}, regime={packet['market_regime']}\n"
+        f"Research: {compact_json(research_manager)}\n"
+        f"Bull/Bear: {debate}"
+    )
     trader = call_ai(
         "💹 Trader",
-        data
-        + "\n\nRESEARCH MANAGER:\n"
-        + json.dumps(research_manager, ensure_ascii=False)
-        + "\n\nBULL:\n"
-        + json.dumps(bull, ensure_ascii=False)
-        + "\n\nBEAR:\n"
-        + json.dumps(bear, ensure_ascii=False),
-        """
-Ubah thesis menjadi rencana paper-trade.
-Pilih LONG, SHORT, atau WAIT.
-Jelaskan entry logic, invalidation, dan risk/reward.
-Belum boleh memutuskan portfolio final.
-""",
+        trader_input,
+        "Ubah thesis menjadi rencana paper-trade LONG/SHORT/WAIT. Fokus entry condition, invalidation, dan apakah setup layak secara risk/reward. Jangan menjadi final judge.",
+        tier="analyst",
+        budget=240,
     )
 
-    risk_agents = []
-
+    # 5) Risk team: tiga perspektif ringan, input sangat ringkas.
     risk_specs = [
-        (
-            "🟢 Aggressive Risk Manager",
-            "Cari peluang dengan toleransi risiko lebih tinggi, tetapi tetap cek invalidation."
-        ),
-        (
-            "🟡 Neutral Risk Manager",
-            "Cari keseimbangan peluang vs risiko dan validasi risk/reward."
-        ),
-        (
-            "🔴 Conservative Risk Manager",
-            "Prioritaskan perlindungan modal, false breakout, spread, volatilitas, dan invalidation."
-        ),
+        ("🟢 Aggressive Risk Manager", "Toleransi risiko lebih tinggi; cari peluang tetapi tetap cek invalidation."),
+        ("🟡 Neutral Risk Manager", "Seimbangkan peluang vs risiko dan validasi setup."),
+        ("🔴 Conservative Risk Manager", "Prioritaskan perlindungan modal, spread, volatilitas, dan false breakout."),
     ]
-
     risk_input = (
-        data
-        + "\n\nRESEARCH:\n"
-        + json.dumps(research_manager, ensure_ascii=False)
-        + "\n\nTRADER PLAN:\n"
-        + json.dumps(trader, ensure_ascii=False)
+        f"Symbol={symbol}; price={packet['price']:.8f}; regime={packet['market_regime']}; "
+        f"spread={packet['order_book']['spread']:.3f}%; imbalance={packet['order_book']['imbalance']:+.2%}; "
+        f"support={packet['support']:.8f}; resistance={packet['resistance']:.8f}; "
+        f"Research={compact_json(research_manager)}; Trader={compact_json(trader)}"
     )
-
+    risk_agents = []
     for name, rule in risk_specs:
-        result = call_ai(
-            name,
-            risk_input,
-            rule + "\nKamu boleh menolak rencana Trader jika risikonya tidak layak.",
-        )
         risk_agents.append({
             "agent": name,
-            **result,
+            **call_ai(
+                name,
+                risk_input,
+                rule + " Boleh menolak rencana Trader jika risiko tidak layak.",
+                tier="analyst",
+                budget=220,
+            ),
         })
+    risk_summary = risk_summary_text(risk_agents)
 
-    risk_summary = "\n\n".join(
-        f"{x['agent']}: {x['decision']} | confidence={x['confidence']:.0f}\n"
-        f"{x['reasoning']}\nRisk: {x['key_risk']}"
-        for x in risk_agents
+    # 6) Final Judge = satu-satunya model terbaik. Input berupa decision packet ringkas.
+    judge_input = (
+        f"MARKET: {symbol} price={packet['price']:.8f} regime={packet['market_regime']} "
+        f"support={packet['support']:.8f} resistance={packet['resistance']:.8f} "
+        f"spread={packet['order_book']['spread']:.3f}% imbalance={packet['order_book']['imbalance']:+.2%}\n"
+        f"ANALYSTS:\n{analyst_summary}\n"
+        f"BULL/BEAR:\n{debate}\n"
+        f"RESEARCH:\n{compact_json(research_manager)}\n"
+        f"TRADER:\n{compact_json(trader)}\n"
+        f"RISK:\n{risk_summary}"
     )
-
     portfolio = call_ai(
-        "👨‍⚖️ Portfolio Manager / Final Judge",
-        data
-        + "\n\nANALYSTS:\n"
-        + analyst_summary
-        + "\n\nBULL vs BEAR:\n"
-        + debate
-        + "\n\nRESEARCH MANAGER:\n"
-        + json.dumps(research_manager, ensure_ascii=False)
-        + "\n\nTRADER:\n"
-        + json.dumps(trader, ensure_ascii=False)
-        + "\n\nRISK TEAM:\n"
-        + risk_summary,
-        """
-Ini keputusan final.
-
-Jangan memakai voting mayoritas secara buta.
-Pertimbangkan:
-1. kualitas bukti,
-2. konflik antar timeframe,
-3. Bull vs Bear,
-4. rencana Trader,
-5. tiga perspektif Risk,
-6. spread dan order book,
-7. market regime,
-8. jarak ke support/resistance.
-
-Pilih LONG, SHORT, atau WAIT.
-
-Jika data konflik atau risk/reward buruk, pilih WAIT.
-Confidence harus mencerminkan kekuatan bukti, bukan rasa percaya diri.
-""",
+        "👨‍⚖️ Final Judge",
+        judge_input,
+        "Ambil keputusan final LONG/SHORT/WAIT. Jangan voting mayoritas secara buta. Prioritaskan kualitas bukti, konflik timeframe, Bull vs Bear, research, trader plan, risk team, spread, regime, dan jarak support/resistance. Jika konflik berat atau risk/reward buruk, WAIT.",
+        tier="judge",
     )
 
     final = portfolio["decision"]
 
-    # Hard safety gate: AI tidak boleh memaksa posisi ketika consensus lemah.
+    # Hard safety gate tetap dilakukan Python, bukan dipercayakan ke LLM.
     analyst_direction = sum(
-        1 if x["decision"] == "LONG"
-        else -1 if x["decision"] == "SHORT"
-        else 0
+        1 if x["decision"] == "LONG" else -1 if x["decision"] == "SHORT" else 0
         for x in analyst_results
     )
-
     risk_direction = sum(
-        1 if x["decision"] == "LONG"
-        else -1 if x["decision"] == "SHORT"
-        else 0
+        1 if x["decision"] == "LONG" else -1 if x["decision"] == "SHORT" else 0
         for x in risk_agents
     )
+    judge_conf = portfolio.get("confidence", 0)
 
+    # Jika hakim lemah atau evidence numerik terlalu konflik, WAIT.
+    if judge_conf < 55:
+        final = "WAIT"
     if abs(analyst_direction) <= 1 and abs(risk_direction) <= 1:
         final = "WAIT"
 
-    # Entry / SL / TP are deterministic from current price + ATR,
-    # not invented by the LLM.
     current = packet["price"]
     atr15 = packet["timeframes"]["15m"]["atr"]
-
     if final == "LONG":
         sl = current - 1.0 * atr15
         tp = current + 2.0 * atr15
@@ -794,7 +808,6 @@ Confidence harus mencerminkan kekuatan bukti, bukan rasa percaya diri.
     else:
         sl = None
         tp = None
-
     rr = 2.0 if final in {"LONG", "SHORT"} else 0.0
 
     return {
@@ -814,6 +827,7 @@ Confidence harus mencerminkan kekuatan bukti, bukan rasa percaya diri.
         "sl": sl,
         "tp": tp,
         "rr": rr,
+        "model_tiers": MODEL_TIERS,
     }
 
 # -------------------------
@@ -1064,7 +1078,7 @@ def telegram_message(result):
     final = result["final"]
     icon = "🚀" if final == "LONG" else "🩸"
 
-    return f"""🚨 AI TRADING V5
+    return f"""🚨 AI TRADING V5.1
 
 {icon} {result['symbol']}
 SIGNAL: {final}
@@ -1094,10 +1108,10 @@ if "scan" not in st.session_state:
 if "last_result" not in st.session_state:
     st.session_state.last_result = None
 
-st.title("🧠 AI Consensus Trading V5")
+st.title("🧠 AI Consensus Trading V5.1")
 st.caption(
-    "Crypto Scanner → Analyst Team → Bull ↔ Bear → Research Manager → "
-    "Trader → Risk Debate → Portfolio Manager → Memory → Paper Trading"
+    "Crypto Scanner → ⚡ Analyst → 🐂 Bull ↔ 🐻 Bear → 🧠 Research → 💹 Trader → "
+    "🛡️ Risk Team → 👨‍⚖️ Final Judge → Memory → Paper Trading"
 )
 
 st.sidebar.header("🔎 Market Scanner")
@@ -1125,10 +1139,13 @@ st.sidebar.write(
     "Groq:",
     "🟢 SIAP" if GROQ_KEY else "🔴 BELUM ADA"
 )
-st.sidebar.caption(f"Model: {GROQ_MODEL}")
-st.sidebar.caption(
-    "Satu kandidat dapat memakai beberapa panggilan AI karena setiap agen memiliki peran berbeda."
-)
+st.sidebar.caption("Arsitektur model: ringan → menengah → kuat → terbaik")
+st.sidebar.caption(f"⚡ Analyst: {ANALYST_MODEL} (reasoning low)")
+st.sidebar.caption(f"🧠 Bull/Bear: {DEBATE_MODEL} (reasoning low)")
+st.sidebar.caption(f"🧠🧠 Research: {RESEARCH_MODEL} (reasoning medium)")
+st.sidebar.caption(f"👨‍⚖️ Judge: {JUDGE_MODEL} (reasoning high)")
+st.sidebar.caption("Output agent dipadatkan agar hemat token dan mengurangi TPM rate-limit.")
+st.sidebar.caption(f"⏱️ Jeda AI: {GROQ_MIN_DELAY:.1f}s | Retry 429: aktif")
 
 st.sidebar.divider()
 st.sidebar.header("📱 Telegram")
@@ -1191,7 +1208,7 @@ if st.session_state.get("confirm_reset", False):
 # -------------------------
 perf = performance()
 
-st.subheader("📊 V5 Performance Memory")
+st.subheader("📊 V5.1 Performance Memory")
 
 p1, p2, p3, p4, p5 = st.columns(5)
 p1.metric("Signal Closed", perf["closed"])
@@ -1209,7 +1226,7 @@ st.divider()
 if not st.session_state.scan:
     st.info(
         "Klik **SCAN MARKET** untuk mencari kandidat crypto. "
-        "V5 tidak mengeksekusi order."
+        "V5.1 tidak mengeksekusi order."
     )
 else:
     st.subheader("🔥 Top Kandidat")
@@ -1486,7 +1503,7 @@ else:
             ):
                 signal_id = save_signal(result)
                 st.success(
-                    f"Signal tersimpan ke memory V5. ID: {signal_id}"
+                    f"Signal tersimpan ke memory V5.1. ID: {signal_id}"
                 )
 
                 if tg_on:
@@ -1561,6 +1578,6 @@ else:
     )
 
 st.caption(
-    "V5 adalah sistem riset/paper trading. Tidak mengeksekusi order otomatis. "
+    "V5.1 adalah sistem riset/paper trading. Tidak mengeksekusi order otomatis. "
     "Hasil historis tidak menjamin hasil masa depan."
 )
