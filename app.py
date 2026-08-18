@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 from groq import Groq
 
 # ============================================================
-# AI CONSENSUS TRADING V5
+# AI CONSENSUS TRADING V5.3
 # TradingAgents-style multi-agent crypto research system
 # - Binance public market data
 # - 4 specialist analysts
@@ -438,28 +438,27 @@ def scan_markets(n=60):
     )
 
 # -------------------------
-# AI engine — V5.2 Multi-Provider Safe Mode
+# AI engine — V5.3 Hierarchical Multi-Model Safe Mode
 # -------------------------
-# V5.2 design goals:
-# - NEVER use provider-side JSON response_format. The provider must not reject
-#   the request because of JSON validation/schema rules.
-# - Ask for JSON in plain text, then parse/validate it locally.
+# V5.3 design goals:
+# - Use strict Structured Outputs for GPT-OSS where supported.
+# - Use JSON Object Mode + local validation for other models.
 # - Groq keys rotate legitimately when a key is rate-limited/quota/auth-failed.
 # - DeepSeek is a second provider. If Groq fails, DeepSeek is tried automatically.
 # - Provider/model failures are isolated; one failed agent does not crash the app.
 # - Keep the existing multi-agent orchestration intact.
 
 ANALYST_MODEL = secret("ANALYST_MODEL") or "openai/gpt-oss-20b"
-DEBATE_MODEL = secret("DEBATE_MODEL") or "openai/gpt-oss-20b"
-RESEARCH_MODEL = secret("RESEARCH_MODEL") or "openai/gpt-oss-20b"
-JUDGE_MODEL = secret("JUDGE_MODEL") or "openai/gpt-oss-20b"
+DEBATE_MODEL = secret("DEBATE_MODEL") or "qwen/qwen3.6-27b"
+RESEARCH_MODEL = secret("RESEARCH_MODEL") or "openai/gpt-oss-120b"
+JUDGE_MODEL = secret("JUDGE_MODEL") or "openai/gpt-oss-120b"
 
-DEEPSEEK_MODEL = secret("DEEPSEEK_MODEL") or "deepseek-chat"
+DEEPSEEK_MODEL = secret("DEEPSEEK_MODEL") or "deepseek-v4-flash"
 
-ANALYST_MAX_TOKENS = int(secret("ANALYST_MAX_TOKENS") or 1200)
-DEBATE_MAX_TOKENS = int(secret("DEBATE_MAX_TOKENS") or 1200)
-RESEARCH_MAX_TOKENS = int(secret("RESEARCH_MAX_TOKENS") or 1400)
-JUDGE_MAX_TOKENS = int(secret("JUDGE_MAX_TOKENS") or 1600)
+ANALYST_MAX_TOKENS = int(secret("ANALYST_MAX_TOKENS") or 500)
+DEBATE_MAX_TOKENS = int(secret("DEBATE_MAX_TOKENS") or 700)
+RESEARCH_MAX_TOKENS = int(secret("RESEARCH_MAX_TOKENS") or 900)
+JUDGE_MAX_TOKENS = int(secret("JUDGE_MAX_TOKENS") or 1000)
 
 MAX_AI_CALLS_PER_CANDIDATE = int(secret("MAX_AI_CALLS_PER_CANDIDATE") or 12)
 GROQ_MIN_DELAY = float(secret("GROQ_MIN_DELAY") or 1.0)
@@ -477,22 +476,46 @@ for _i in range(1, 21):
 DEEPSEEK_KEYS = list(dict.fromkeys(k for k in _DEEPSEEK_KEYS if k))
 
 MODEL_TIERS = {
-    "analyst": {"model": ANALYST_MODEL, "max_tokens": ANALYST_MAX_TOKENS},
-    "debate": {"model": DEBATE_MODEL, "max_tokens": DEBATE_MAX_TOKENS},
-    "research": {"model": RESEARCH_MODEL, "max_tokens": RESEARCH_MAX_TOKENS},
-    "judge": {"model": JUDGE_MODEL, "max_tokens": JUDGE_MAX_TOKENS},
+    # Fast numerical/indicator interpretation.
+    "analyst": {
+        "model": ANALYST_MODEL,
+        "max_tokens": ANALYST_MAX_TOKENS,
+        "reasoning_effort": "low",
+    },
+    # Debate needs a different model family to reduce correlated opinions.
+    "debate": {
+        "model": DEBATE_MODEL,
+        "max_tokens": DEBATE_MAX_TOKENS,
+        "reasoning_effort": "medium",
+    },
+    # Strong synthesis.
+    "research": {
+        "model": RESEARCH_MODEL,
+        "max_tokens": RESEARCH_MAX_TOKENS,
+        "reasoning_effort": "medium",
+    },
+    # Strongest final arbiter.
+    "judge": {
+        "model": JUDGE_MODEL,
+        "max_tokens": JUDGE_MAX_TOKENS,
+        "reasoning_effort": "high",
+    },
 }
 
 AI_SCHEMA = {
     "type": "object",
     "properties": {
-        "decision": {"type": "string"},
+        "decision": {"type": "string", "enum": ["LONG", "SHORT", "WAIT"]},
         "confidence": {"type": "number"},
         "reasoning": {"type": "string"},
         "key_risk": {"type": "string"},
-        "evidence": {"type": "array"},
+        "evidence": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
     },
     "required": ["decision", "confidence", "reasoning", "key_risk", "evidence"],
+    "additionalProperties": False,
 }
 
 def compact_json(obj, max_chars=1400):
@@ -540,7 +563,7 @@ def _is_quota_error(message):
     return any(x in msg for x in (
         "tokens per day", "requests per day", "daily limit", "daily quota",
         "quota exceeded", "quota has been exceeded", "insufficient_quota",
-        "limit reached", "billing", "resource_exhausted"
+        "billing", "resource_exhausted"
     ))
 
 def _is_rate_limit_error(message):
@@ -557,7 +580,7 @@ def _is_model_not_found(message):
 
 def _build_prompt(role, data, instructions):
     # IMPORTANT: the literal word JSON is intentionally present. This is
-    # harmless because V5.2 does NOT send response_format=json_object, but it
+    # harmless because V5.3 uses model-aware response_format, but it
     # also makes the prompt compatible if a provider enforces JSON wording.
     return f"""
 Kamu adalah {role} dalam sistem riset trading multi-agent.
@@ -660,21 +683,34 @@ def _normalize_ai(obj, tier, provider="unknown", model=None):
 def _groq_client(key):
     return Groq(api_key=key)
 
-def _request_groq(model, prompt, key, max_tokens):
-    # V5.2 intentionally does NOT send response_format. This eliminates
-    # provider-side JSON validation errors such as json_validate_failed and
-    # "messages must contain the word json".
+def _request_groq(model, prompt, key, max_tokens, tier):
     kwargs = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.2,
-        # GPT-OSS spends completion budget on reasoning as well as visible JSON.
-        # The old 420-token default could consume the whole budget before content
-        # was produced, which appeared in the UI as "Respons AI kosong".
-        "max_completion_tokens": max(900, int(max_tokens)),
+        "max_completion_tokens": max(256, int(max_tokens)),
     }
+
+    # Model-aware reasoning. GPT-OSS supports low/medium/high; Qwen does not
+    # use these same values, so we deliberately omit the parameter for Qwen.
     if model in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}:
-        kwargs["reasoning_effort"] = "low"
+        effort = MODEL_TIERS[tier].get("reasoning_effort", "low")
+        kwargs["reasoning_effort"] = effort
+
+        # Strict Structured Outputs are supported by GPT-OSS 20B/120B.
+        # This removes the malformed-JSON problem that affected Research.
+        kwargs["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "trading_agent_decision",
+                "strict": True,
+                "schema": AI_SCHEMA,
+            },
+        }
+    else:
+        # Qwen/other Groq models: use ordinary JSON mode, then validate locally.
+        kwargs["response_format"] = {"type": "json_object"}
+
     return _groq_client(key).chat.completions.create(**kwargs)
 
 def _request_deepseek(model, prompt, key, max_tokens):
@@ -794,11 +830,14 @@ def call_ai(role, data, instructions, tier="analyst", budget=None):
                     msg = str(e)
                     errors.append(f"{provider} {_key_mask(key)} / {model}: {msg[:240]}")
 
-                    if _is_quota_error(msg):
-                        _disable_key(provider, key_index, 24 * 60 * 60, "Quota harian")
-                        continue
+                    # Rate-limit must be checked BEFORE generic quota wording.
+                    # Groq TPM errors often contain the phrase "limit reached";
+                    # they are temporary and must NOT disable a key for 24 hours.
                     if _is_rate_limit_error(msg):
                         _disable_key(provider, key_index, GROQ_RETRY_SECONDS if provider == "groq" else 90, "Rate limit")
+                        continue
+                    if _is_quota_error(msg):
+                        _disable_key(provider, key_index, 24 * 60 * 60, "Quota harian")
                         continue
                     if _is_auth_error(msg) or "insufficient balance" in msg.lower() or "http 402" in msg.lower():
                         _disable_key(provider, key_index, 24 * 60 * 60, "API key/balance")
@@ -915,8 +954,81 @@ def packet_text(packet):
 
     return "\n".join(lines)
 
+
+def specialist_data(packet, focus):
+    """Give each specialist only the market fields it is responsible for.
+    This is a major token-saving change: analysts no longer receive an
+    identical full market dump.
+    """
+    tf = packet["timeframes"]
+    lines = [
+        f"Symbol: {packet['symbol']}",
+        f"Harga: {packet['price']:.8f}",
+        f"Regime: {packet['market_regime']}",
+        f"Support: {packet['support']:.8f}",
+        f"Resistance: {packet['resistance']:.8f}",
+    ]
+    if focus == "technical":
+        for name in ("5m", "15m", "1h"):
+            x = tf[name]
+            lines += [
+                f"[{name}] EMA20={x['ema20']:.8f} EMA50={x['ema50']:.8f} EMA200={x['ema200']:.8f}",
+                f"[{name}] MACD_HIST={x['macd_hist']:.8f} RSI={x['rsi']:.2f}",
+            ]
+    elif focus == "momentum":
+        for name in ("5m", "15m", "1h"):
+            x = tf[name]
+            lines += [
+                f"[{name}] RSI={x['rsi']:.2f} VOL_RATIO={x['vol_ratio']:.2f}x BUY_PRESSURE={x['buy_pressure']:.1%}",
+                f"[{name}] MACD_HIST={x['macd_hist']:.8f}",
+            ]
+    elif focus == "orderflow":
+        ob = packet["order_book"]
+        x = tf["15m"]
+        lines += [
+            f"Order imbalance={ob['imbalance']:+.2%}",
+            f"Spread={ob['spread']:.3f}% BidDepth={ob['bid_depth']:.4f} AskDepth={ob['ask_depth']:.4f}",
+            f"15m BUY_PRESSURE={x['buy_pressure']:.1%} VOL_RATIO={x['vol_ratio']:.2f}x",
+        ]
+    else:  # price action
+        c = packet["candlestick"]
+        x = tf["15m"]
+        lines += [
+            f"Candle={c['name']} Body={c['body']:.1%} UpperWick={c['upper_wick']:.1%} LowerWick={c['lower_wick']:.1%}",
+            f"15m RSI={x['rsi']:.2f} EMA20={x['ema20']:.8f} EMA50={x['ema50']:.8f}",
+            f"15m VOL_RATIO={x['vol_ratio']:.2f}x MACD_HIST={x['macd_hist']:.8f}",
+        ]
+    return "\n".join(lines)
+
+
+def memory_context(symbol, limit=5):
+    """Small historical context. Memory is now actually consumed by Research,
+    while remaining strictly limited to already-closed paper trades.
+    """
+    try:
+        con = db()
+        rows = con.execute(
+            """
+            SELECT final_decision, confidence, result, r_multiple, market_regime
+            FROM signals
+            WHERE symbol=? AND result IN ('TP','SL')
+            ORDER BY id DESC LIMIT ?
+            """,
+            (symbol, int(limit)),
+        ).fetchall()
+        con.close()
+    except Exception:
+        return "Tidak ada memory historis yang tersedia."
+    if not rows:
+        return "Belum ada paper-trade historis tertutup untuk simbol ini."
+    return "\n".join(
+        f"{i+1}. {r['final_decision']} C={float(r['confidence'] or 0):.0f} "
+        f"hasil={r['result']} R={float(r['r_multiple'] or 0):+.1f} regime={r['market_regime']}"
+        for i, r in enumerate(rows)
+    )
+
 # -------------------------
-# V5.1.1 Token-Efficient orchestration
+# V5.3 Hierarchical orchestration
 # -------------------------
 ANALYSTS = [
     ("🧭 Technical Analyst", "Fokus trend multi-timeframe, EMA, MACD, support/resistance, dan regime."),
@@ -960,12 +1072,18 @@ def run_multi_agent(symbol, scanner_score_value):
 
     # 1) Four analyst ringan. Mereka tidak melihat output agent lain dan tidak menjadi hakim.
     analyst_results = []
+    focus_map = {
+        "🧭 Technical Analyst": "technical",
+        "⚡ Momentum Analyst": "momentum",
+        "📚 Order Flow Analyst": "orderflow",
+        "🕯️ Price Action Analyst": "priceaction",
+    }
     for name, rule in ANALYSTS:
         analyst_results.append({
             "agent": name,
             **call_ai(
                 name,
-                data,
+                specialist_data(packet, focus_map[name]),
                 rule + " Berikan thesis mandiri untuk diteruskan ke Bull dan Bear.",
                 tier="analyst",
             ),
@@ -973,18 +1091,21 @@ def run_multi_agent(symbol, scanner_score_value):
 
     analyst_summary = analyst_summary_text(analyst_results)
 
-    # 2) Debat: model menengah. Keduanya menerima ringkasan yang sama agar debat fair.
+    # 2) Debat: Bull membuat thesis terlebih dahulu. Bear benar-benar melihat
+    # thesis Bull lalu menyerangnya. Ini lebih sesuai dengan konsep "debate"
+    # daripada dua jawaban independen yang hanya kebetulan dibandingkan.
     debate_data = data + "\n\nRINGKASAN ANALYST:\n" + analyst_summary
     bull = call_ai(
         "🐂 Bull Researcher",
         debate_data,
-        "Bangun kasus LONG paling kuat. Serang kelemahan skenario bearish, tetapi akui risiko dan kondisi invalidasi.",
+        "Bangun kasus LONG paling kuat. Tunjukkan bukti utama, kondisi yang membatalkan thesis, dan risiko terbesar. Jangan menjadi final judge.",
         tier="debate",
     )
+    bear_data = debate_data + "\n\nTHESIS BULL YANG HARUS DISERANG:\n" + compact_json(bull, 1100)
     bear = call_ai(
         "🐻 Bear Researcher",
-        debate_data,
-        "Bangun kasus SHORT/WAIT paling kuat. Serang kelemahan Bull dengan resistance, overextension, flow berlawanan, dan false breakout.",
+        bear_data,
+        "Serang thesis Bull secara spesifik. Cari bukti yang bertentangan, resistance, overextension, flow berlawanan, false breakout, konflik timeframe, dan alasan WAIT/SHORT. Jangan sekadar berbeda pendapat tanpa bukti.",
         tier="debate",
     )
     debate = debate_summary_text(bull, bear)
@@ -994,6 +1115,7 @@ def run_multi_agent(symbol, scanner_score_value):
         data
         + "\n\nANALYST SUMMARY:\n" + analyst_summary
         + "\n\nBULL vs BEAR:\n" + debate
+        + "\n\nMEMORY HISTORIS PAPER TRADE:\n" + memory_context(symbol)
     )
     research_manager = call_ai(
         "🧠 Research Manager",
@@ -1052,7 +1174,8 @@ def run_multi_agent(symbol, scanner_score_value):
         f"BULL/BEAR:\n{debate}\n"
         f"RESEARCH:\n{compact_json(research_manager)}\n"
         f"TRADER:\n{compact_json(trader)}\n"
-        f"RISK:\n{risk_summary}"
+        f"RISK:\n{risk_summary}\n"
+        f"MEMORY: {memory_context(symbol, 3)}"
     )
     portfolio = call_ai(
         "👨‍⚖️ Final Judge",
@@ -1074,11 +1197,18 @@ def run_multi_agent(symbol, scanner_score_value):
     )
     judge_conf = portfolio.get("confidence", 0)
 
-    # Jika hakim lemah atau evidence numerik terlalu konflik, WAIT.
+    # Hard safety gate: jangan override Judge hanya karena voting sederhana.
+    # Kita hanya memaksa WAIT jika Judge lemah, atau jika Analyst + Risk benar-benar
+    # berlawanan kuat dengan keputusan final. Bull/Bear/Research tetap menjadi
+    # bahan reasoning, bukan voting mayoritas.
     if judge_conf < 55:
         final = "WAIT"
-    if abs(analyst_direction) <= 1 and abs(risk_direction) <= 1:
-        final = "WAIT"
+    else:
+        support_dir = analyst_direction + risk_direction
+        if final == "LONG" and support_dir <= -3:
+            final = "WAIT"
+        elif final == "SHORT" and support_dir >= 3:
+            final = "WAIT"
 
     current = packet["price"]
     atr15 = packet["timeframes"]["15m"]["atr"]
@@ -1361,7 +1491,7 @@ def telegram_message(result):
     final = result["final"]
     icon = "🚀" if final == "LONG" else "🩸"
 
-    return f"""🚨 AI TRADING V5.1.1
+    return f"""🚨 AI TRADING V5.3
 
 {icon} {result['symbol']}
 SIGNAL: {final}
@@ -1391,7 +1521,7 @@ if "scan" not in st.session_state:
 if "last_result" not in st.session_state:
     st.session_state.last_result = None
 
-st.title("🧠 AI Consensus Trading V5.2")
+st.title("🧠 AI Consensus Trading V5.3")
 st.caption(
     "Crypto Scanner → ⚡ Analyst → 🐂 Bull ↔ 🐻 Bear → 🧠 Research → 💹 Trader → "
     "🛡️ Risk Team → 👨‍⚖️ Final Judge → Memory → Paper Trading"
@@ -1431,10 +1561,10 @@ if GROQ_KEYS:
 else:
     st.sidebar.caption("Tambahkan GROQ_API_KEY atau GROQ_API_KEYS di Streamlit Secrets.")
 st.sidebar.caption("Arsitektur model: ringan → menengah → kuat → terbaik")
-st.sidebar.caption(f"⚡ Analyst: {ANALYST_MODEL} (GPT-OSS reasoning low)")
-st.sidebar.caption(f"🧠 Bull/Bear: {DEBATE_MODEL} (plain-text JSON, local parser)")
-st.sidebar.caption(f"🧠🧠 Research: {RESEARCH_MODEL} (plain-text JSON, local parser)")
-st.sidebar.caption(f"👨‍⚖️ Judge: {JUDGE_MODEL} (plain-text JSON, local parser)")
+st.sidebar.caption(f"⚡ Analyst: {ANALYST_MODEL} | reasoning low")
+st.sidebar.caption(f"🧠 Bull/Bear: {DEBATE_MODEL} | debate model")
+st.sidebar.caption(f"🧠🧠 Research: {RESEARCH_MODEL} | reasoning medium + strict JSON jika didukung")
+st.sidebar.caption(f"👨‍⚖️ Judge: {JUDGE_MODEL} | reasoning high + strict JSON jika didukung")
 st.sidebar.caption("Output agent dipadatkan agar hemat token dan mengurangi TPM rate-limit.")
 st.sidebar.caption(f"⏱️ Jeda AI: {GROQ_MIN_DELAY:.1f}s | Retry 429: aktif")
 
@@ -1451,7 +1581,7 @@ if not TG_TOKEN or not TG_CHAT:
     )
 
 if st.sidebar.button("📨 Test Telegram", use_container_width=True):
-    ok, msg = telegram("✅ TEST AI CONSENSUS TRADING V5\nTelegram berhasil terhubung.")
+    ok, msg = telegram("✅ TEST AI CONSENSUS TRADING V5.3\nTelegram berhasil terhubung.")
     st.sidebar.success(msg) if ok else st.sidebar.error(msg)
 
 st.sidebar.divider()
@@ -1499,7 +1629,7 @@ if st.session_state.get("confirm_reset", False):
 # -------------------------
 perf = performance()
 
-st.subheader("📊 V5.1.1 Performance Memory")
+st.subheader("📊 V5.3 Performance Memory")
 
 p1, p2, p3, p4, p5 = st.columns(5)
 p1.metric("Signal Closed", perf["closed"])
@@ -1517,7 +1647,7 @@ st.divider()
 if not st.session_state.scan:
     st.info(
         "Klik **SCAN MARKET** untuk mencari kandidat crypto. "
-        "V5.1.1 tidak mengeksekusi order."
+        "V5.3 tidak mengeksekusi order."
     )
 else:
     st.subheader("🔥 Top Kandidat")
@@ -1794,7 +1924,7 @@ else:
             ):
                 signal_id = save_signal(result)
                 st.success(
-                    f"Signal tersimpan ke memory V5.1.1. ID: {signal_id}"
+                    f"Signal tersimpan ke memory V5.3. ID: {signal_id}"
                 )
 
                 if tg_on:
@@ -1869,6 +1999,6 @@ else:
     )
 
 st.caption(
-    "V5.1.1 adalah sistem riset/paper trading. Tidak mengeksekusi order otomatis. "
+    "V5.3 adalah sistem riset/paper trading. Tidak mengeksekusi order otomatis. "
     "Hasil historis tidak menjamin hasil masa depan."
 )
