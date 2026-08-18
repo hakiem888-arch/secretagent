@@ -448,7 +448,8 @@ def scan_markets(n=60):
 # - Robust JSON parsing + one retry for 429/temporary failures.
 # - Short decision packets keep token usage under control.
 ANALYST_MODEL = secret("ANALYST_MODEL") or "openai/gpt-oss-20b"
-DEBATE_MODEL = secret("DEBATE_MODEL") or "llama-3.3-70b-versatile"
+DEBATE_MODEL = secret("DEBATE_MODEL") or "openai/gpt-oss-20b"
+DEBATE_FALLBACK_MODEL = secret("DEBATE_FALLBACK_MODEL") or "llama-3.1-8b-instant"
 RESEARCH_MODEL = secret("RESEARCH_MODEL") or "openai/gpt-oss-120b"
 JUDGE_MODEL = secret("JUDGE_MODEL") or "openai/gpt-oss-120b"
 
@@ -555,6 +556,23 @@ def groq_client(api_key=None):
 
 def is_gpt_oss(model_name):
     return str(model_name).startswith("openai/gpt-oss-")
+
+def _is_model_not_found(message):
+    msg = str(message).lower()
+    return (
+        "model_not_found" in msg
+        or "does not exist" in msg
+        or "do not have access to it" in msg
+    )
+
+def _is_json_validation_error(message):
+    msg = str(message).lower()
+    return (
+        "json_validate_failed" in msg
+        or "failed to validate json" in msg
+        or "generated json does not match" in msg
+    )
+
 
 # Strict schemas deliberately stay simple to maximize reliability and minimize tokens.
 AI_SCHEMA = {
@@ -709,6 +727,9 @@ def _request_groq(tier, prompt, api_key=None):
 
     # GPT-OSS 20B/120B support strict JSON Schema. This prevents the
     # "Unterminated string" / malformed JSON problem seen in Research Manager.
+    # Prefer strict JSON Schema for GPT-OSS, but call_ai() has a fallback to
+    # JSON Object Mode if Groq rejects the generated schema/output. This makes
+    # the app resilient to SDK/model-side validation changes.
     if cfg["structured"] and is_gpt_oss(model_name):
         kwargs["response_format"] = {
             "type": "json_schema",
@@ -719,118 +740,145 @@ def _request_groq(tier, prompt, api_key=None):
             },
         }
     else:
-        # Llama and other non-structured models get basic JSON Object Mode.
-        # Do not send reasoning_effort to them.
         kwargs["response_format"] = {"type": "json_object"}
 
     return client.chat.completions.create(**kwargs)
 
+
+def _request_groq_json_object(tier, prompt, api_key=None):
+    client = groq_client(api_key)
+    if not client:
+        raise RuntimeError("GROQ_API_KEY belum dikonfigurasi.")
+    cfg = MODEL_TIERS[tier]
+    model_name = cfg["model"]
+    kwargs = {
+        "model": model_name,
+        "messages": [{"role":"user", "content":prompt}],
+        "temperature": 0.1,
+        "max_completion_tokens": cfg["max_tokens"],
+        "response_format": {"type":"json_object"},
+    }
+    if is_gpt_oss(model_name):
+        kwargs["reasoning_effort"] = cfg["reasoning_effort"]
+        kwargs["reasoning_format"] = "hidden"
+    return client.chat.completions.create(**kwargs)
+
 def call_ai(role, data, instructions, tier="analyst", budget=None):
-    """Call one AI agent with automatic Groq API-key failover."""
+    """Call one AI agent with key failover + model/schema fallback."""
     if tier not in MODEL_TIERS:
         tier = "analyst"
 
     cfg = MODEL_TIERS[tier]
-
     if not GROQ_KEYS:
-        return {
-            "decision": "WAIT",
-            "confidence": 0,
-            "reasoning": "Tidak ada GROQ API key yang dikonfigurasi.",
-            "key_risk": "AI tidak tersedia.",
-            "evidence": [],
-            "tier": tier,
-            "model": cfg["model"],
-        }
+        return {"decision":"WAIT","confidence":0,
+                "reasoning":"Tidak ada GROQ API key yang dikonfigurasi.",
+                "key_risk":"AI tidak tersedia.","evidence":[],
+                "tier":tier,"model":cfg["model"]}
 
     calls_used = int(st.session_state.get("_ai_calls_current_candidate", 0))
     if calls_used >= MAX_AI_CALLS_PER_CANDIDATE:
-        return {
-            "decision": "WAIT",
-            "confidence": 0,
-            "reasoning": "Batas panggilan AI per kandidat tercapai.",
-            "key_risk": "Perlu menghemat quota API.",
-            "evidence": [],
-            "tier": tier,
-            "model": cfg["model"],
-        }
+        return {"decision":"WAIT","confidence":0,
+                "reasoning":"Batas panggilan AI per kandidat tercapai.",
+                "key_risk":"Perlu menghemat quota API.","evidence":[],
+                "tier":tier,"model":cfg["model"]}
     st.session_state["_ai_calls_current_candidate"] = calls_used + 1
 
     cfg_for_call = dict(cfg)
     if budget:
         cfg_for_call["max_tokens"] = int(budget)
-
     original_cfg = MODEL_TIERS[tier]
     MODEL_TIERS[tier] = cfg_for_call
     prompt = _build_prompt(role, data, instructions)
-
     errors = []
 
+    # Try configured model first. If the model is unavailable to a key/project,
+    # continue with other keys, then use the tier fallback model.
+    models_to_try = [cfg_for_call["model"]]
+    if tier == "debate" and DEBATE_FALLBACK_MODEL not in models_to_try:
+        models_to_try.append(DEBATE_FALLBACK_MODEL)
+    if "openai/gpt-oss-20b" not in models_to_try:
+        models_to_try.append("openai/gpt-oss-20b")
+
     try:
-        state = _groq_state()
         active = int(st.session_state.get("_groq_active_key", 0)) % len(GROQ_KEYS)
         ordered = list(range(active, len(GROQ_KEYS))) + list(range(0, active))
 
-        for key_index in ordered:
-            if _key_disabled(key_index):
+        for model_name in models_to_try:
+            # Temporarily select this model while preserving tier settings.
+            cfg_for_model = dict(cfg_for_call)
+            cfg_for_model["model"] = model_name
+            MODEL_TIERS[tier] = cfg_for_model
+
+            model_failed_for_all_keys = True
+
+            for key_index in ordered:
+                if _key_disabled(key_index):
+                    continue
+                key = GROQ_KEYS[key_index]
+                last_call = st.session_state.get("_last_ai_call", 0.0)
+                wait = GROQ_MIN_DELAY - (time.time() - last_call)
+                if wait > 0:
+                    time.sleep(wait)
+
+                try:
+                    response = _request_groq(tier, prompt, api_key=key)
+                    st.session_state["_last_ai_call"] = time.time()
+                    st.session_state["_groq_active_key"] = key_index
+                    content = response.choices[0].message.content or ""
+                    obj = _safe_json_from_text(content)
+                    return _normalize_ai(obj, tier)
+
+                except Exception as e:
+                    msg = str(e)
+                    errors.append(f"{_key_mask(key)} / {model_name}: {msg[:220]}")
+
+                    if _is_quota_error(msg):
+                        # Rotate to another legitimately configured key. If keys
+                        # belong to the same Groq org, they may share the same quota.
+                        _disable_key(key_index, 24 * 60 * 60, "Quota harian")
+                        continue
+
+                    if _is_rate_limit_error(msg):
+                        _disable_key(key_index, max(60, GROQ_RETRY_SECONDS), "Rate limit")
+                        continue
+
+                    if _is_auth_error(msg):
+                        _disable_key(key_index, 24 * 60 * 60, "API key invalid/auth")
+                        continue
+
+                    if _is_model_not_found(msg):
+                        # This can be key/project-specific. Try the next key.
+                        continue
+
+                    if _is_json_validation_error(msg) and is_gpt_oss(model_name):
+                        # Strict JSON Schema failed. Retry this same key/model in
+                        # plain JSON Object Mode instead of killing the whole agent.
+                        try:
+                            response = _request_groq_json_object(tier, prompt, api_key=key)
+                            st.session_state["_last_ai_call"] = time.time()
+                            st.session_state["_groq_active_key"] = key_index
+                            obj = _safe_json_from_text(response.choices[0].message.content or "")
+                            return _normalize_ai(obj, tier)
+                        except Exception as e2:
+                            errors.append(f"{_key_mask(key)} / json_object: {str(e2)[:220]}")
+                            continue
+
+                    # Non-transient 400 errors are model/request errors. Try the
+                    # next model rather than repeating the exact same request.
+                    model_failed_for_all_keys = False
+                    break
+
+            # If every key failed because the model isn't accessible, try fallback.
+            if model_failed_for_all_keys or errors:
                 continue
 
-            key = GROQ_KEYS[key_index]
-
-            last_call = st.session_state.get("_last_ai_call", 0.0)
-            wait = GROQ_MIN_DELAY - (time.time() - last_call)
-            if wait > 0:
-                time.sleep(wait)
-
-            try:
-                response = _request_groq(tier, prompt, api_key=key)
-                st.session_state["_last_ai_call"] = time.time()
-                st.session_state["_groq_active_key"] = key_index
-
-                content = response.choices[0].message.content or ""
-                obj = _safe_json_from_text(content)
-                return _normalize_ai(obj, tier)
-
-            except Exception as e:
-                msg = str(e)
-                errors.append(f"{_key_mask(key)}: {msg[:220]}")
-
-                if _is_quota_error(msg):
-                    # Do not use multiple keys to bypass a provider/org daily quota.
-                    # Groq documents RPD/TPD at the organization level.
-                    _disable_key(key_index, 24 * 60 * 60, "Quota harian")
-                    raise RuntimeError(
-                        f"Quota harian Groq habis untuk key {_key_mask(key)}. "
-                        "Tambahkan kapasitas/provider yang sah atau tunggu reset."
-                    )
-
-                if _is_rate_limit_error(msg):
-                    _disable_key(key_index, max(60, GROQ_RETRY_SECONDS), "Rate limit")
-                    continue
-
-                if _is_auth_error(msg):
-                    _disable_key(key_index, 24 * 60 * 60, "API key invalid/auth")
-                    continue
-
-                # 400/model/schema/JSON errors are not normally fixed by
-                # changing credentials, so expose the actual error.
-                raise
-
-        raise RuntimeError(
-            "Semua Groq API key sedang tidak tersedia/rate-limited. "
-            + " | ".join(errors[-4:])
-        )
+        raise RuntimeError("Semua API key/model gagal. " + " | ".join(errors[-6:]))
 
     except Exception as e:
-        return {
-            "decision": "WAIT",
-            "confidence": 0,
-            "reasoning": f"AI gagal menghasilkan JSON: {e}",
-            "key_risk": "Output AI gagal diproses atau quota API habis.",
-            "evidence": [],
-            "tier": tier,
-            "model": cfg_for_call["model"],
-        }
+        return {"decision":"WAIT","confidence":0,
+                "reasoning":f"AI gagal menghasilkan JSON: {e}",
+                "key_risk":"Output AI gagal diproses atau quota API habis.",
+                "evidence":[],"tier":tier,"model":cfg_for_call["model"]}
     finally:
         MODEL_TIERS[tier] = original_cfg
 
