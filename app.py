@@ -421,7 +421,7 @@ def scan_markets(n=60):
 # Setiap tingkat memakai model sesuai tingkat reasoning yang dibutuhkan.
 # Model dan token budget bisa diganti lewat Streamlit Secrets tanpa mengubah kode.
 ANALYST_MODEL = secret("ANALYST_MODEL") or "openai/gpt-oss-20b"
-DEBATE_MODEL = secret("DEBATE_MODEL") or "llama-3.3-70b-versatile"
+DEBATE_MODEL = secret("DEBATE_MODEL") or "qwen/qwen3.6-27b"
 RESEARCH_MODEL = secret("RESEARCH_MODEL") or "openai/gpt-oss-120b"
 JUDGE_MODEL = secret("JUDGE_MODEL") or "openai/gpt-oss-120b"
 
