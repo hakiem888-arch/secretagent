@@ -438,228 +438,209 @@ def scan_markets(n=60):
     )
 
 # -------------------------
-# AI engine — V5.1.1 Token-Efficient Multi-Model
+# AI engine — V5.2 Multi-Provider Safe Mode
 # -------------------------
-# V5.1.1 fixes:
-# - reasoning_effort is sent ONLY to GPT-OSS models that support it.
-# - Strict JSON Schema is used for GPT-OSS 20B/120B.
-# - Llama debate agents use JSON Object Mode instead of reasoning_effort.
-# - Research/Judge get a larger completion budget to avoid truncated JSON.
-# - Robust JSON parsing + one retry for 429/temporary failures.
-# - Short decision packets keep token usage under control.
+# V5.2 design goals:
+# - NEVER use provider-side JSON response_format. The provider must not reject
+#   the request because of JSON validation/schema rules.
+# - Ask for JSON in plain text, then parse/validate it locally.
+# - Groq keys rotate legitimately when a key is rate-limited/quota/auth-failed.
+# - DeepSeek is a second provider. If Groq fails, DeepSeek is tried automatically.
+# - Provider/model failures are isolated; one failed agent does not crash the app.
+# - Keep the existing multi-agent orchestration intact.
+
 ANALYST_MODEL = secret("ANALYST_MODEL") or "openai/gpt-oss-20b"
 DEBATE_MODEL = secret("DEBATE_MODEL") or "openai/gpt-oss-20b"
-DEBATE_FALLBACK_MODEL = secret("DEBATE_FALLBACK_MODEL") or "openai/gpt-oss-20b"
-RESEARCH_MODEL = secret("RESEARCH_MODEL") or "openai/gpt-oss-120b"
-JUDGE_MODEL = secret("JUDGE_MODEL") or "openai/gpt-oss-120b"
+RESEARCH_MODEL = secret("RESEARCH_MODEL") or "openai/gpt-oss-20b"
+JUDGE_MODEL = secret("JUDGE_MODEL") or "openai/gpt-oss-20b"
 
-ANALYST_MAX_TOKENS = int(secret("ANALYST_MAX_TOKENS") or 280)
-DEBATE_MAX_TOKENS = int(secret("DEBATE_MAX_TOKENS") or 360)
-RESEARCH_MAX_TOKENS = int(secret("RESEARCH_MAX_TOKENS") or 700)
-JUDGE_MAX_TOKENS = int(secret("JUDGE_MAX_TOKENS") or 620)
+DEEPSEEK_MODEL = secret("DEEPSEEK_MODEL") or "deepseek-chat"
+
+ANALYST_MAX_TOKENS = int(secret("ANALYST_MAX_TOKENS") or 420)
+DEBATE_MAX_TOKENS = int(secret("DEBATE_MAX_TOKENS") or 500)
+RESEARCH_MAX_TOKENS = int(secret("RESEARCH_MAX_TOKENS") or 650)
+JUDGE_MAX_TOKENS = int(secret("JUDGE_MAX_TOKENS") or 700)
 
 MAX_AI_CALLS_PER_CANDIDATE = int(secret("MAX_AI_CALLS_PER_CANDIDATE") or 12)
 GROQ_MIN_DELAY = float(secret("GROQ_MIN_DELAY") or 1.0)
-GROQ_RETRY_SECONDS = float(secret("GROQ_RETRY_SECONDS") or 15)
+GROQ_RETRY_SECONDS = float(secret("GROQ_RETRY_SECONDS") or 30.0)
+AI_PROVIDER_ORDER = [x.strip().lower() for x in
+                     (secret("AI_PROVIDER_ORDER") or "groq,deepseek").split(",")
+                     if x.strip()]
 
-# GPT-OSS supports low/medium/high. Other models must not receive
-# reasoning_effort=low/medium/high because Groq can reject that request.
+# Multiple DeepSeek keys. DEEPSEEK_API_KEY is the legacy/default key.
+_DEEPSEEK_KEYS = []
+_DEEPSEEK_KEYS.extend(_parse_secret_list(secret("DEEPSEEK_API_KEY")))
+_DEEPSEEK_KEYS.extend(_parse_secret_list(secret("DEEPSEEK_API_KEYS")))
+for _i in range(1, 21):
+    _DEEPSEEK_KEYS.extend(_parse_secret_list(secret(f"DEEPSEEK_API_KEY_{_i}")))
+DEEPSEEK_KEYS = list(dict.fromkeys(k for k in _DEEPSEEK_KEYS if k))
+
 MODEL_TIERS = {
-    "analyst": {
-        "model": ANALYST_MODEL,
-        "max_tokens": ANALYST_MAX_TOKENS,
-        "reasoning_effort": "low",
-        "structured": True,
-    },
-    "debate": {
-        "model": DEBATE_MODEL,
-        "max_tokens": DEBATE_MAX_TOKENS,
-        "reasoning_effort": None,
-        "structured": False,
-    },
-    "research": {
-        "model": RESEARCH_MODEL,
-        "max_tokens": RESEARCH_MAX_TOKENS,
-        "reasoning_effort": "medium",
-        "structured": True,
-    },
-    "judge": {
-        "model": JUDGE_MODEL,
-        "max_tokens": JUDGE_MAX_TOKENS,
-        "reasoning_effort": "high",
-        "structured": True,
-    },
+    "analyst": {"model": ANALYST_MODEL, "max_tokens": ANALYST_MAX_TOKENS},
+    "debate": {"model": DEBATE_MODEL, "max_tokens": DEBATE_MAX_TOKENS},
+    "research": {"model": RESEARCH_MODEL, "max_tokens": RESEARCH_MAX_TOKENS},
+    "judge": {"model": JUDGE_MODEL, "max_tokens": JUDGE_MAX_TOKENS},
 }
 
-def _groq_state():
-    if "groq_key_state" not in st.session_state:
-        st.session_state.groq_key_state = {
-            i: {"disabled_until": 0.0, "reason": "", "failures": 0}
-            for i in range(len(GROQ_KEYS))
-        }
-    return st.session_state.groq_key_state
-
-
-def _key_mask(key):
-    if not key:
-        return "-"
-    return f"{key[:5]}...{key[-4:]}" if len(key) > 12 else "***"
-
-
-def _key_disabled(index):
-    state = _groq_state().get(index, {})
-    return float(state.get("disabled_until", 0)) > time.time()
-
-
-def _disable_key(index, seconds, reason):
-    state = _groq_state().setdefault(
-        index, {"disabled_until": 0.0, "reason": "", "failures": 0}
-    )
-    state["disabled_until"] = time.time() + seconds
-    state["reason"] = reason[:180]
-    state["failures"] = int(state.get("failures", 0)) + 1
-
-
-def _is_quota_error(message):
-    msg = str(message).lower()
-    return any(term in msg for term in (
-        "tokens per day",
-        "requests per day",
-        "daily limit",
-        "daily quota",
-        "quota exceeded",
-        "quota has been exceeded",
-        "insufficient_quota",
-        "limit reached",
-        "billing",
-    ))
-
-
-def _is_rate_limit_error(message):
-    msg = str(message).lower()
-    return "429" in msg or "rate_limit" in msg or "rate limit" in msg
-
-
-def _is_auth_error(message):
-    msg = str(message).lower()
-    return (
-        "401" in msg or "403" in msg
-        or "invalid api key" in msg
-        or "authentication" in msg
-    )
-
-
-def groq_client(api_key=None):
-    key = api_key or GROQ_KEY
-    return Groq(api_key=key) if key else None
-
-
-def is_gpt_oss(model_name):
-    return str(model_name).startswith("openai/gpt-oss-")
-
-def _is_model_not_found(message):
-    msg = str(message).lower()
-    return (
-        "model_not_found" in msg
-        or "does not exist" in msg
-        or "do not have access to it" in msg
-    )
-
-def _is_json_validation_error(message):
-    msg = str(message).lower()
-    return (
-        "json_validate_failed" in msg
-        or "failed to validate json" in msg
-        or "generated json does not match" in msg
-    )
-
-
-# Strict schemas deliberately stay simple to maximize reliability and minimize tokens.
 AI_SCHEMA = {
     "type": "object",
     "properties": {
-        "decision": {
-            "type": "string",
-            "enum": ["LONG", "SHORT", "WAIT"],
-        },
-        "confidence": {
-            "type": "number",
-        },
-        "reasoning": {
-            "type": "string",
-        },
-        "key_risk": {
-            "type": "string",
-        },
-        "evidence": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
+        "decision": {"type": "string"},
+        "confidence": {"type": "number"},
+        "reasoning": {"type": "string"},
+        "key_risk": {"type": "string"},
+        "evidence": {"type": "array"},
     },
-    "required": [
-        "decision",
-        "confidence",
-        "reasoning",
-        "key_risk",
-        "evidence",
-    ],
-    "additionalProperties": False,
+    "required": ["decision", "confidence", "reasoning", "key_risk", "evidence"],
 }
 
-def model_for(tier):
-    cfg = MODEL_TIERS[tier]
-    return cfg["model"]
-
 def compact_json(obj, max_chars=1400):
-    """Compact an agent result before passing it to another agent."""
     if isinstance(obj, dict):
         evidence = obj.get("evidence", [])
         if not isinstance(evidence, list):
             evidence = [str(evidence)] if evidence else []
-        payload = {
+        obj = {
             "decision": obj.get("decision", "WAIT"),
             "confidence": obj.get("confidence", 0),
             "reasoning": obj.get("reasoning", ""),
             "key_risk": obj.get("key_risk", ""),
             "evidence": evidence[:3],
         }
-    else:
-        payload = obj
-    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    return text[:max_chars]
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))[:max_chars]
 
+def _provider_state(name):
+    key = f"{name}_key_state"
+    if key not in st.session_state:
+        keys = GROQ_KEYS if name == "groq" else DEEPSEEK_KEYS
+        st.session_state[key] = {
+            i: {"disabled_until": 0.0, "reason": "", "failures": 0}
+            for i in range(len(keys))
+        }
+    return st.session_state[key]
+
+def _key_mask(key):
+    if not key:
+        return "-"
+    return f"{key[:5]}...{key[-4:]}" if len(key) > 12 else "***"
+
+def _key_disabled(provider, index):
+    return float(_provider_state(provider).get(index, {}).get("disabled_until", 0)) > time.time()
+
+def _disable_key(provider, index, seconds, reason):
+    state = _provider_state(provider).setdefault(
+        index, {"disabled_until": 0.0, "reason": "", "failures": 0}
+    )
+    state["disabled_until"] = time.time() + seconds
+    state["reason"] = str(reason)[:180]
+    state["failures"] = int(state.get("failures", 0)) + 1
+
+def _is_quota_error(message):
+    msg = str(message).lower()
+    return any(x in msg for x in (
+        "tokens per day", "requests per day", "daily limit", "daily quota",
+        "quota exceeded", "quota has been exceeded", "insufficient_quota",
+        "limit reached", "billing", "resource_exhausted"
+    ))
+
+def _is_rate_limit_error(message):
+    msg = str(message).lower()
+    return "429" in msg or "rate_limit" in msg or "rate limit" in msg or "too many requests" in msg
+
+def _is_auth_error(message):
+    msg = str(message).lower()
+    return any(x in msg for x in ("401", "403", "invalid api key", "authentication", "unauthorized"))
+
+def _is_model_not_found(message):
+    msg = str(message).lower()
+    return "model_not_found" in msg or "does not exist" in msg or "do not have access" in msg
+
+def _build_prompt(role, data, instructions):
+    # IMPORTANT: the literal word JSON is intentionally present. This is
+    # harmless because V5.2 does NOT send response_format=json_object, but it
+    # also makes the prompt compatible if a provider enforces JSON wording.
+    return f"""
+Kamu adalah {role} dalam sistem riset trading multi-agent.
+
+TUGAS:
+{instructions}
+
+ATURAN WAJIB:
+1. Gunakan hanya data yang diberikan. Jangan mengarang fakta.
+2. Jika bukti tidak cukup, pilih WAIT.
+3. Jawab dalam Bahasa Indonesia.
+4. Jawaban akhir WAJIB berupa SATU OBJECT JSON VALID.
+5. JSON harus memiliki tepat struktur berikut:
+{{"decision":"LONG|SHORT|WAIT","confidence":0,"reasoning":"alasan singkat","key_risk":"risiko utama","evidence":["bukti 1","bukti 2"]}}
+6. decision hanya LONG, SHORT, atau WAIT.
+7. confidence adalah angka 0 sampai 100.
+8. evidence adalah array string, maksimal 3 item.
+9. Jangan gunakan markdown, jangan gunakan ```json, dan jangan menulis teks sebelum/sesudah JSON.
+10. Kata JSON di atas berarti output akhir harus benar-benar JSON yang dapat diparse Python.
+
+DATA:
+{data}
+"""
 
 def _safe_json_from_text(raw):
-    """Parse JSON defensively. Structured Outputs should make this unnecessary
-    for GPT-OSS, but it protects the app when a different model is selected."""
     raw = (raw or "").strip()
+    if not raw:
+        raise ValueError("Respons AI kosong.")
+
+    # Remove common markdown fences without depending on them.
+    cleaned = re.sub(r"```(?:json)?\s*", "", raw, flags=re.I).replace("```", "").strip()
 
     try:
-        return json.loads(raw)
+        obj = json.loads(cleaned)
+        if isinstance(obj, dict):
+            return obj
     except Exception:
         pass
 
-    if "{" in raw and "}" in raw:
-        candidate = raw[raw.find("{"):raw.rfind("}") + 1]
-        try:
-            return json.loads(candidate)
-        except Exception:
-            pass
+    # Find balanced JSON object, respecting quoted strings.
+    starts = [m.start() for m in re.finditer(r"\{", cleaned)]
+    for start_pos in starts:
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start_pos, len(cleaned)):
+            ch = cleaned[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = cleaned[start_pos:i+1]
+                    try:
+                        obj = json.loads(candidate)
+                        if isinstance(obj, dict):
+                            return obj
+                    except Exception:
+                        break
+    raise ValueError("Respons AI bukan JSON valid.")
 
-    raise ValueError("Respons AI bukan JSON valid atau JSON terpotong.")
-
-def _normalize_ai(obj, tier):
+def _normalize_ai(obj, tier, provider="unknown", model=None):
     if not isinstance(obj, dict):
         raise ValueError("Output AI bukan object JSON.")
 
-    decision = str(obj.get("decision", "WAIT")).upper()
+    decision = str(obj.get("decision", "WAIT")).upper().strip()
     if decision not in {"LONG", "SHORT", "WAIT"}:
         decision = "WAIT"
 
     try:
         confidence = float(obj.get("confidence", 0) or 0)
     except Exception:
-        confidence = 0
+        confidence = 0.0
 
     evidence = obj.get("evidence", [])
     if not isinstance(evidence, list):
@@ -672,157 +653,168 @@ def _normalize_ai(obj, tier):
         "key_risk": str(obj.get("key_risk", ""))[:400],
         "evidence": [str(x)[:180] for x in evidence[:3]],
         "tier": tier,
-        "model": MODEL_TIERS[tier]["model"],
+        "provider": provider,
+        "model": model or MODEL_TIERS[tier]["model"],
     }
 
-def _build_prompt(role, data, instructions):
-    return f"""
-Kamu adalah {role} dalam sistem riset trading multi-agent.
+def _groq_client(key):
+    return Groq(api_key=key)
 
-TUGAS KHUSUSMU:
-{instructions}
-
-ATURAN:
-- Gunakan hanya data yang diberikan.
-- Jangan mengarang harga, berita, volume, indikator, atau fakta eksternal.
-- Jangan menjanjikan profit.
-- Jika bukti tidak cukup, pilih WAIT.
-- Jawab dalam Bahasa Indonesia.
-- Jangan mengambil alih tugas agent lain.
-- reasoning maksimal 2 kalimat.
-- key_risk maksimal 1 kalimat.
-- evidence maksimal 3 poin dan setiap poin singkat.
-- confidence adalah angka 0 sampai 100.
-
-DATA:
-{data}
-"""
-
-def _request_groq(tier, prompt, api_key=None):
-    """Reliable Groq request using JSON Object Mode for all models."""
-    client = groq_client(api_key)
-    if not client:
-        raise RuntimeError("GROQ_API_KEY belum dikonfigurasi.")
-    cfg = MODEL_TIERS[tier]
-    model_name = cfg["model"]
+def _request_groq(model, prompt, key, max_tokens):
+    # V5.2 intentionally does NOT send response_format. This eliminates
+    # provider-side JSON validation errors such as json_validate_failed and
+    # "messages must contain the word json".
     kwargs = {
-        "model": model_name,
+        "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
-        "max_completion_tokens": cfg["max_tokens"],
-        "response_format": {"type": "json_object"},
+        "max_completion_tokens": max_tokens,
     }
-    if is_gpt_oss(model_name):
-        kwargs["reasoning_effort"] = cfg["reasoning_effort"] or "low"
-        kwargs["reasoning_format"] = "hidden"
-    return client.chat.completions.create(**kwargs)
+    # GPT-OSS can use reasoning_effort, but omitting it is safer across model
+    # variants/projects and keeps this provider call maximally compatible.
+    return _groq_client(key).chat.completions.create(**kwargs)
+
+def _request_deepseek(model, prompt, key, max_tokens):
+    url = "https://api.deepseek.com/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+        # No response_format: local parser handles JSON.
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=90)
+    if r.status_code >= 400:
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text[:500]
+        raise RuntimeError(f"HTTP {r.status_code}: {detail}")
+    body = r.json()
+    choices = body.get("choices") or []
+    if not choices:
+        raise RuntimeError("DeepSeek tidak mengembalikan choices.")
+    return choices[0].get("message", {}).get("content", "")
+
+def _ordered_key_indices(provider):
+    keys = GROQ_KEYS if provider == "groq" else DEEPSEEK_KEYS
+    if not keys:
+        return []
+    state_key = "_active_groq_key" if provider == "groq" else "_active_deepseek_key"
+    active = int(st.session_state.get(state_key, 0)) % len(keys)
+    return list(range(active, len(keys))) + list(range(0, active))
+
+def _provider_models(provider, tier):
+    if provider == "groq":
+        primary = MODEL_TIERS[tier]["model"]
+        # If a configured 120B/unsupported model fails, 20B is the safe fallback.
+        models = [primary]
+        if "openai/gpt-oss-20b" not in models:
+            models.append("openai/gpt-oss-20b")
+        return list(dict.fromkeys(models))
+    return [DEEPSEEK_MODEL]
 
 def call_ai(role, data, instructions, tier="analyst", budget=None):
-    """Call one AI agent with key failover + model/schema fallback."""
     if tier not in MODEL_TIERS:
         tier = "analyst"
 
+    if not st.session_state.get("_ai_calls_current_candidate", 0):
+        st.session_state["_ai_calls_current_candidate"] = 0
+
+    used = int(st.session_state["_ai_calls_current_candidate"])
+    if used >= MAX_AI_CALLS_PER_CANDIDATE:
+        return {
+            "decision": "WAIT", "confidence": 0,
+            "reasoning": "Batas panggilan AI per kandidat tercapai.",
+            "key_risk": "Quota perlu dihemat.", "evidence": [],
+            "tier": tier, "provider": "none", "model": ""
+        }
+    st.session_state["_ai_calls_current_candidate"] = used + 1
+
     cfg = MODEL_TIERS[tier]
-    if not GROQ_KEYS:
-        return {"decision":"WAIT","confidence":0,
-                "reasoning":"Tidak ada GROQ API key yang dikonfigurasi.",
-                "key_risk":"AI tidak tersedia.","evidence":[],
-                "tier":tier,"model":cfg["model"]}
-
-    calls_used = int(st.session_state.get("_ai_calls_current_candidate", 0))
-    if calls_used >= MAX_AI_CALLS_PER_CANDIDATE:
-        return {"decision":"WAIT","confidence":0,
-                "reasoning":"Batas panggilan AI per kandidat tercapai.",
-                "key_risk":"Perlu menghemat quota API.","evidence":[],
-                "tier":tier,"model":cfg["model"]}
-    st.session_state["_ai_calls_current_candidate"] = calls_used + 1
-
-    cfg_for_call = dict(cfg)
-    if budget:
-        cfg_for_call["max_tokens"] = int(budget)
-    original_cfg = MODEL_TIERS[tier]
-    MODEL_TIERS[tier] = cfg_for_call
+    max_tokens = int(budget or cfg["max_tokens"])
     prompt = _build_prompt(role, data, instructions)
     errors = []
 
-    # Try configured model first. If the model is unavailable to a key/project,
-    # continue with other keys, then use the tier fallback model.
-    models_to_try = [cfg_for_call["model"]]
-    fallback = DEBATE_FALLBACK_MODEL if tier == "debate" else "openai/gpt-oss-20b"
-    if fallback and fallback not in models_to_try:
-        models_to_try.append(fallback)
+    providers = [p for p in AI_PROVIDER_ORDER if p in {"groq", "deepseek"}]
+    # Always append configured providers if the setting was malformed/empty.
+    if GROQ_KEYS and "groq" not in providers:
+        providers.append("groq")
+    if DEEPSEEK_KEYS and "deepseek" not in providers:
+        providers.append("deepseek")
 
-    try:
-        active = int(st.session_state.get("_groq_active_key", 0)) % len(GROQ_KEYS)
-        ordered = list(range(active, len(GROQ_KEYS))) + list(range(0, active))
+    for provider in providers:
+        keys = GROQ_KEYS if provider == "groq" else DEEPSEEK_KEYS
+        if not keys:
+            continue
 
-        for model_name in models_to_try:
-            # Temporarily select this model while preserving tier settings.
-            cfg_for_model = dict(cfg_for_call)
-            cfg_for_model["model"] = model_name
-            MODEL_TIERS[tier] = cfg_for_model
+        for model in _provider_models(provider, tier):
+            model_access_failed = True
 
-            model_failed_for_all_keys = True
-
-            for key_index in ordered:
-                if _key_disabled(key_index):
+            for key_index in _ordered_key_indices(provider):
+                if _key_disabled(provider, key_index):
                     continue
-                key = GROQ_KEYS[key_index]
-                last_call = st.session_state.get("_last_ai_call", 0.0)
-                wait = GROQ_MIN_DELAY - (time.time() - last_call)
-                if wait > 0:
-                    time.sleep(wait)
 
+                key = keys[key_index]
                 try:
-                    response = _request_groq(tier, prompt, api_key=key)
-                    st.session_state["_last_ai_call"] = time.time()
-                    st.session_state["_groq_active_key"] = key_index
-                    content = response.choices[0].message.content or ""
+                    if provider == "groq":
+                        last = float(st.session_state.get("_last_ai_call", 0))
+                        wait = GROQ_MIN_DELAY - (time.time() - last)
+                        if wait > 0:
+                            time.sleep(wait)
+                        raw = _request_groq(model, prompt, key, max_tokens)
+                        st.session_state["_last_ai_call"] = time.time()
+                        st.session_state["_active_groq_key"] = key_index
+                        content = raw.choices[0].message.content or ""
+                    else:
+                        content = _request_deepseek(model, prompt, key, max_tokens)
+                        st.session_state["_active_deepseek_key"] = key_index
+
                     obj = _safe_json_from_text(content)
-                    return _normalize_ai(obj, tier)
+                    return _normalize_ai(obj, tier, provider, model)
 
                 except Exception as e:
                     msg = str(e)
-                    errors.append(f"{_key_mask(key)} / {model_name}: {msg[:220]}")
+                    errors.append(f"{provider} {_key_mask(key)} / {model}: {msg[:240]}")
 
                     if _is_quota_error(msg):
-                        # Rotate to another legitimately configured key. If keys
-                        # belong to the same Groq org, they may share the same quota.
-                        _disable_key(key_index, 24 * 60 * 60, "Quota harian")
+                        _disable_key(provider, key_index, 24 * 60 * 60, "Quota harian")
                         continue
-
                     if _is_rate_limit_error(msg):
-                        _disable_key(key_index, max(60, GROQ_RETRY_SECONDS), "Rate limit")
+                        _disable_key(provider, key_index, GROQ_RETRY_SECONDS if provider == "groq" else 90, "Rate limit")
                         continue
-
                     if _is_auth_error(msg):
-                        _disable_key(key_index, 24 * 60 * 60, "API key invalid/auth")
+                        _disable_key(provider, key_index, 24 * 60 * 60, "API key/auth")
                         continue
-
                     if _is_model_not_found(msg):
-                        # This can be key/project-specific. Try the next key.
+                        # Try another key/model/provider.
+                        continue
+                    if "timeout" in msg.lower() or "connection" in msg.lower():
+                        _disable_key(provider, key_index, 60, "Network/timeout")
                         continue
 
-                    # Non-transient 400 errors are model/request errors. Try the
-                    # next model rather than repeating the exact same request.
-                    model_failed_for_all_keys = False
-                    break
+                    # A malformed response is retried with another key/provider.
+                    model_access_failed = False
+                    continue
 
-            # Try fallback only when every attempt reported model access/not-found.
-            if model_failed_for_all_keys:
-                continue
-            break
+            # If this model failed across all available keys, move to fallback model/provider.
+            continue
 
-        raise RuntimeError("Semua API key/model gagal. " + " | ".join(errors[-6:]))
-
-    except Exception as e:
-        return {"decision":"WAIT","confidence":0,
-                "reasoning":f"AI gagal menghasilkan JSON: {e}",
-                "key_risk":"Output AI gagal diproses atau quota API habis.",
-                "evidence":[],"tier":tier,"model":cfg_for_call["model"]}
-    finally:
-        MODEL_TIERS[tier] = original_cfg
-
+    summary = " | ".join(errors[-5:]) if errors else "Tidak ada provider API yang tersedia."
+    return {
+        "decision": "WAIT",
+        "confidence": 0,
+        "reasoning": f"AI gagal setelah mencoba provider yang tersedia: {summary}",
+        "key_risk": "Periksa API key, quota, akses model, atau koneksi provider.",
+        "evidence": [],
+        "tier": tier,
+        "provider": "none",
+        "model": "",
+    }
 
 # -------------------------
 # Market packet
