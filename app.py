@@ -787,7 +787,15 @@ ANALYSTS = [
     ("📚 Order Flow Analyst", "Fokus order-book imbalance, spread, liquidity, dan tekanan beli/jual."),
     ("🕯️ Price Action Analyst", "Fokus candle, wick, rejection, breakout, struktur harga, support/resistance."),
 ]
-
+def compact_json(obj):
+    """
+    Mengubah dictionary/objek Python menjadi string JSON 
+    yang super padat (tanpa spasi) untuk menghemat token LLM.
+    """
+    try:
+        return json.dumps(obj, separators=(',', ':'))
+    except Exception:
+        return str(obj)
 
 def analyst_summary_text(items):
     lines = []
