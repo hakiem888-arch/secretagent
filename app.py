@@ -418,101 +418,56 @@ def scan_markets(n=60):
 # -------------------------
 # AI engine — V5.1.1 Token-Efficient Multi-Model
 # -------------------------
-ANALYST_MODEL = secret("ANALYST_MODEL") or "openai/gpt-oss-20b"
-DEBATE_MODEL = secret("DEBATE_MODEL") or "qwen/qwen3.6-27b" # DIUBAH: Menggunakan Qwen yang terbukti ada di akun Anda!
-RESEARCH_MODEL = secret("RESEARCH_MODEL") or "openai/gpt-oss-120b"
-JUDGE_MODEL = secret("JUDGE_MODEL") or "openai/gpt-oss-120b"
 
-ANALYST_MAX_TOKENS = int(secret("ANALYST_MAX_TOKENS") or 280)
-DEBATE_MAX_TOKENS = int(secret("DEBATE_MAX_TOKENS") or 360)
-RESEARCH_MAX_TOKENS = int(secret("RESEARCH_MAX_TOKENS") or 700)
-JUDGE_MAX_TOKENS = int(secret("JUDGE_MAX_TOKENS") or 620)
+# KITA KUNCI MODELNYA DI SINI. ABAIKAN STREAMLIT SECRETS!
+# Ganti ke Qwen karena gpt-oss-20b limit token hariannya sudah habis (Error 429)
+ANALYST_MODEL = "qwen/qwen3.6-27b"
+DEBATE_MODEL = "qwen/qwen3.6-27b"
+RESEARCH_MODEL = "openai/gpt-oss-120b"
+JUDGE_MODEL = "openai/gpt-oss-120b"
 
-MAX_AI_CALLS_PER_CANDIDATE = int(secret("MAX_AI_CALLS_PER_CANDIDATE") or 12)
-GROQ_MIN_DELAY = float(secret("GROQ_MIN_DELAY") or 1.0)
-GROQ_RETRY_SECONDS = float(secret("GROQ_RETRY_SECONDS") or 15)
+ANALYST_MAX_TOKENS = 280
+DEBATE_MAX_TOKENS = 360
+RESEARCH_MAX_TOKENS = 700
+JUDGE_MAX_TOKENS = 620
+
+GROQ_MIN_DELAY = 1.0
+GROQ_RETRY_SECONDS = 15
 
 MODEL_TIERS = {
-    "analyst": {
-        "model": ANALYST_MODEL,
-        "max_tokens": ANALYST_MAX_TOKENS,
-        "reasoning_effort": "low",
-        "structured": True,
-    },
-    "debate": {
-        "model": DEBATE_MODEL,
-        "max_tokens": DEBATE_MAX_TOKENS,
-        "reasoning_effort": None,
-        "structured": False,
-    },
-    "research": {
-        "model": RESEARCH_MODEL,
-        "max_tokens": RESEARCH_MAX_TOKENS,
-        "reasoning_effort": "medium",
-        "structured": True,
-    },
-    "judge": {
-        "model": JUDGE_MODEL,
-        "max_tokens": JUDGE_MAX_TOKENS,
-        "reasoning_effort": "high",
-        "structured": True,
-    },
+    "analyst": {"model": ANALYST_MODEL, "max_tokens": ANALYST_MAX_TOKENS},
+    "debate": {"model": DEBATE_MODEL, "max_tokens": DEBATE_MAX_TOKENS},
+    "research": {"model": RESEARCH_MODEL, "max_tokens": RESEARCH_MAX_TOKENS},
+    "judge": {"model": JUDGE_MODEL, "max_tokens": JUDGE_MAX_TOKENS},
 }
 
 def groq_client():
     return Groq(api_key=GROQ_KEY) if GROQ_KEY else None
 
-def is_gpt_oss(model_name):
-    return str(model_name).startswith("openai/gpt-oss-")
-
-AI_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "decision": {
-            "type": "string",
-            "enum": ["LONG", "SHORT", "WAIT"],
-        },
-        "confidence": {
-            "type": "number",
-        },
-        "reasoning": {
-            "type": "string",
-        },
-        "key_risk": {
-            "type": "string",
-        },
-        "evidence": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-    },
-    "required": [
-        "decision",
-        "confidence",
-        "reasoning",
-        "key_risk",
-        "evidence",
-    ],
-    "additionalProperties": False,
-}
-
-def model_for(tier):
-    cfg = MODEL_TIERS[tier]
-    return cfg["model"]
-
 def _safe_json_from_text(raw):
     raw = (raw or "").strip()
+    # Penawar jika AI menjawab pakai format markdown (```json ...)
+    if raw.startswith("```json"):
+        raw = raw[7:]
+    if raw.startswith("```"):
+        raw = raw[3:]
+    if raw.endswith("```"):
+        raw = raw[:-3]
+    raw = raw.strip()
+
     try:
         return json.loads(raw)
     except Exception:
         pass
+
     if "{" in raw and "}" in raw:
         candidate = raw[raw.find("{"):raw.rfind("}") + 1]
         try:
             return json.loads(candidate)
         except Exception:
             pass
-    raise ValueError("Respons AI bukan JSON valid atau JSON terpotong.")
+
+    raise ValueError("Respons AI bukan JSON valid.")
 
 def _normalize_ai(obj, tier):
     if not isinstance(obj, dict):
@@ -542,24 +497,20 @@ def _normalize_ai(obj, tier):
     }
 
 def _build_prompt(role, data, instructions):
-    return f"""
-Kamu adalah {role} dalam sistem riset trading multi-agent.
+    return f"""Kamu adalah {role} dalam sistem riset trading multi-agent.
+TUGAS KHUSUSMU: {instructions}
 
-TUGAS KHUSUSMU:
-{instructions}
-
-ATURAN PENTING:
-- Gunakan hanya data yang diberikan. Jangan mengarang harga atau indikator.
-- Jika bukti tidak cukup, pilih WAIT.
-- Jawab dalam Bahasa Indonesia.
-- WAJIB JAWAB DALAM FORMAT JSON. JANGAN ADA TEKS LAIN SEBELUM/SESUDAH JSON.
+ATURAN:
+- Gunakan hanya data yang diberikan.
+- WAJIB JAWAB DALAM FORMAT JSON SAJA.
+- DILARANG MENGGUNAKAN MARKDOWN ```json. LANGSUNG MULAI DENGAN TANDA {{.
 
 CONTOH OUTPUT JSON:
 {{
     "decision": "LONG",
     "confidence": 85,
-    "reasoning": "Alasan maksimal 2 kalimat.",
-    "key_risk": "Risiko utama 1 kalimat.",
+    "reasoning": "Alasan singkat.",
+    "key_risk": "Risiko utama.",
     "evidence": ["bukti kuat 1", "bukti kuat 2"]
 }}
 
@@ -573,163 +524,19 @@ def _request_groq(tier, prompt):
         raise RuntimeError("GROQ_API_KEY belum dikonfigurasi.")
 
     cfg = MODEL_TIERS[tier]
-    model_name = cfg["model"]
-
+    
+    # Kita matikan json_schema yang bikin Error 400, pakai format standar yang aman
     kwargs = {
-        "model": model_name,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
+        "model": cfg["model"],
+        "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
         "max_completion_tokens": cfg["max_tokens"],
+        "response_format": {"type": "json_object"}
     }
-
-    if is_gpt_oss(model_name):
-        kwargs["reasoning_effort"] = cfg["reasoning_effort"]
-        kwargs["reasoning_format"] = "hidden"
-
-    if cfg["structured"] and is_gpt_oss(model_name):
-        kwargs["response_format"] = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "trading_agent_decision",
-                "strict": True,
-                "schema": AI_SCHEMA,
-            },
-        }
-    else:
-        kwargs["response_format"] = {"type": "json_object"}
 
     return client.chat.completions.create(**kwargs)
 
-def call_ai(role, data, instructions, tier="analyst", budget=None):
-    if tier not in MODEL_TIERS:
-        tier = "analyst"
-
-    cfg = MODEL_TIERS[tier]
-
-    if not GROQ_KEY:
-        return {
-            "decision": "WAIT",
-            "confidence": 0,
-            "reasoning": "GROQ_API_KEY belum dikonfigurasi.",
-            "key_risk": "AI tidak tersedia.",
-            "evidence": [],
-            "tier": tier,
-            "model": cfg["model"],
-        }
-
-    if budget:
-        cfg_for_call = dict(cfg)
-        cfg_for_call["max_tokens"] = int(budget)
-    else:
-        cfg_for_call = cfg
-
-    original_cfg = MODEL_TIERS[tier]
-    MODEL_TIERS[tier] = cfg_for_call
-
-    prompt = _build_prompt(role, data, instructions)
-
-    try:
-        last_call = st.session_state.get("_last_ai_call", 0.0)
-        wait = GROQ_MIN_DELAY - (time.time() - last_call)
-        if wait > 0:
-            time.sleep(wait)
-
-        try:
-            response = _request_groq(tier, prompt)
-        except Exception as first_error:
-            msg = str(first_error)
-
-            if "429" in msg or "rate_limit" in msg.lower():
-                time.sleep(GROQ_RETRY_SECONDS)
-                response = _request_groq(tier, prompt)
-            else:
-                raise
-
-        st.session_state["_last_ai_call"] = time.time()
-
-        content = response.choices[0].message.content or ""
-        obj = _safe_json_from_text(content)
-        return _normalize_ai(obj, tier)
-
-    except Exception as e:
-        return {
-            "decision": "WAIT",
-            "confidence": 0,
-            "reasoning": f"AI gagal menghasilkan JSON: {e}",
-            "key_risk": "Output AI gagal diproses.",
-            "evidence": [],
-            "tier": tier,
-            "model": cfg_for_call["model"],
-        }
-    finally:
-        MODEL_TIERS[tier] = original_cfg
-
-def _build_prompt(role, data, instructions):
-    return f"""
-Kamu adalah {role} dalam sistem riset trading multi-agent.
-
-TUGAS KHUSUSMU:
-{instructions}
-
-ATURAN:
-- Gunakan hanya data yang diberikan.
-- Jangan mengarang harga, berita, volume, indikator, atau fakta eksternal.
-- Jangan menjanjikan profit.
-- Jika bukti tidak cukup, pilih WAIT.
-- Jawab dalam Bahasa Indonesia.
-- Jangan mengambil alih tugas agent lain.
-- reasoning maksimal 2 kalimat.
-- key_risk maksimal 1 kalimat.
-- evidence maksimal 3 poin dan setiap poin singkat.
-- confidence adalah angka 0 sampai 100.
-- WAJIB KEMBALIKAN OUTPUT DALAM FORMAT JSON.
-
-DATA:
-{data}
-"""
-
-def _request_groq(tier, prompt):
-    client = groq_client()
-    if not client:
-        raise RuntimeError("GROQ_API_KEY belum dikonfigurasi.")
-
-    cfg = MODEL_TIERS[tier]
-    model_name = cfg["model"]
-
-    kwargs = {
-        "model": model_name,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
-        "temperature": 0.1,
-        "max_completion_tokens": cfg["max_tokens"],
-    }
-
-    if is_gpt_oss(model_name):
-        kwargs["reasoning_effort"] = cfg["reasoning_effort"]
-        kwargs["reasoning_format"] = "hidden"
-
-    if cfg["structured"] and is_gpt_oss(model_name):
-        kwargs["response_format"] = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "trading_agent_decision",
-                "strict": True,
-                "schema": AI_SCHEMA,
-            },
-        }
-    else:
-        kwargs["response_format"] = {"type": "json_object"}
-
-    return client.chat.completions.create(**kwargs)
+# === (Fungsi def call_ai(...) tetap berada di bawah ini) ===
 
 def call_ai(role, data, instructions, tier="analyst", budget=None):
     if tier not in MODEL_TIERS:
