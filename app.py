@@ -426,7 +426,7 @@ def scan_markets(n=60):
 # - Robust JSON parsing + one retry for 429/temporary failures.
 # - Short decision packets keep token usage under control.
 ANALYST_MODEL = secret("ANALYST_MODEL") or "openai/gpt-oss-20b"
-DEBATE_MODEL = secret("DEBATE_MODEL") or "openai/gpt-oss-20b"
+DEBATE_MODEL = secret("DEBATE_MODEL") or "qwen/qwen3.6-27b"
 RESEARCH_MODEL = secret("RESEARCH_MODEL") or "openai/gpt-oss-120b"
 JUDGE_MODEL = secret("JUDGE_MODEL") or "openai/gpt-oss-120b"
 
