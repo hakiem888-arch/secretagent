@@ -419,7 +419,7 @@ def scan_markets(n=60):
 # AI engine — V5.1.1 Token-Efficient Multi-Model
 # -------------------------
 ANALYST_MODEL = secret("ANALYST_MODEL") or "openai/gpt-oss-20b"
-DEBATE_MODEL = secret("DEBATE_MODEL") or "openai/gpt-oss-120b" # FIX 2: Diganti agar tidak Error 404
+DEBATE_MODEL = secret("DEBATE_MODEL") or "llama-3.1-70b-versatile" # FIX 2: Diganti agar tidak Error 404
 RESEARCH_MODEL = secret("RESEARCH_MODEL") or "openai/gpt-oss-120b"
 JUDGE_MODEL = secret("JUDGE_MODEL") or "openai/gpt-oss-120b"
 
