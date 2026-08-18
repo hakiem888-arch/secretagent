@@ -438,7 +438,8 @@ def scan_markets(n=60):
     )
 
 # -------------------------
-# AI engine — V5.3 Hierarchical Multi-Model Safe Mode
+# AI engine — V5.3.1 Hierarchical Multi-Model Safe Mode
+# Fix: pass tier into _request_groq; model-specific reasoning for Qwen/GPT-OSS.
 # -------------------------
 # V5.3 design goals:
 # - Use strict Structured Outputs for GPT-OSS where supported.
@@ -694,11 +695,11 @@ def _request_groq(model, prompt, key, max_tokens, tier):
     # Model-aware reasoning. GPT-OSS supports low/medium/high; Qwen does not
     # use these same values, so we deliberately omit the parameter for Qwen.
     if model in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}:
+        # GPT-OSS supports low/medium/high reasoning.
         effort = MODEL_TIERS[tier].get("reasoning_effort", "low")
         kwargs["reasoning_effort"] = effort
 
         # Strict Structured Outputs are supported by GPT-OSS 20B/120B.
-        # This removes the malformed-JSON problem that affected Research.
         kwargs["response_format"] = {
             "type": "json_schema",
             "json_schema": {
@@ -707,8 +708,13 @@ def _request_groq(model, prompt, key, max_tokens, tier):
                 "schema": AI_SCHEMA,
             },
         }
+    elif model.startswith("qwen/"):
+        # Groq's Qwen 3 models use 'default'/'none' for reasoning_effort,
+        # not GPT-OSS's low/medium/high. 'default' keeps thinking enabled.
+        kwargs["reasoning_effort"] = "default"
+        kwargs["response_format"] = {"type": "json_object"}
     else:
-        # Qwen/other Groq models: use ordinary JSON mode, then validate locally.
+        # Other Groq models: JSON Object Mode + local validation.
         kwargs["response_format"] = {"type": "json_object"}
 
     return _groq_client(key).chat.completions.create(**kwargs)
@@ -750,7 +756,8 @@ def _ordered_key_indices(provider):
 def _provider_models(provider, tier):
     if provider == "groq":
         primary = MODEL_TIERS[tier]["model"]
-        # If a configured 120B/unsupported model fails, 20B is the safe fallback.
+        # If the primary model is unavailable, use GPT-OSS 20B as a same-tier
+        # fallback where possible. The tier/reasoning setting is still preserved.
         models = [primary]
         if "openai/gpt-oss-20b" not in models:
             models.append("openai/gpt-oss-20b")
@@ -805,7 +812,7 @@ def call_ai(role, data, instructions, tier="analyst", budget=None):
                         wait = GROQ_MIN_DELAY - (time.time() - last)
                         if wait > 0:
                             time.sleep(wait)
-                        raw = _request_groq(model, prompt, key, max_tokens)
+                        raw = _request_groq(model, prompt, key, max_tokens, tier)
                         st.session_state["_last_ai_call"] = time.time()
                         st.session_state["_active_groq_key"] = key_index
                         message = raw.choices[0].message
