@@ -456,10 +456,10 @@ JUDGE_MODEL = secret("JUDGE_MODEL") or "openai/gpt-oss-20b"
 
 DEEPSEEK_MODEL = secret("DEEPSEEK_MODEL") or "deepseek-chat"
 
-ANALYST_MAX_TOKENS = int(secret("ANALYST_MAX_TOKENS") or 420)
-DEBATE_MAX_TOKENS = int(secret("DEBATE_MAX_TOKENS") or 500)
-RESEARCH_MAX_TOKENS = int(secret("RESEARCH_MAX_TOKENS") or 650)
-JUDGE_MAX_TOKENS = int(secret("JUDGE_MAX_TOKENS") or 700)
+ANALYST_MAX_TOKENS = int(secret("ANALYST_MAX_TOKENS") or 1200)
+DEBATE_MAX_TOKENS = int(secret("DEBATE_MAX_TOKENS") or 1200)
+RESEARCH_MAX_TOKENS = int(secret("RESEARCH_MAX_TOKENS") or 1400)
+JUDGE_MAX_TOKENS = int(secret("JUDGE_MAX_TOKENS") or 1600)
 
 MAX_AI_CALLS_PER_CANDIDATE = int(secret("MAX_AI_CALLS_PER_CANDIDATE") or 12)
 GROQ_MIN_DELAY = float(secret("GROQ_MIN_DELAY") or 1.0)
@@ -667,11 +667,14 @@ def _request_groq(model, prompt, key, max_tokens):
     kwargs = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.1,
-        "max_completion_tokens": max_tokens,
+        "temperature": 0.2,
+        # GPT-OSS spends completion budget on reasoning as well as visible JSON.
+        # The old 420-token default could consume the whole budget before content
+        # was produced, which appeared in the UI as "Respons AI kosong".
+        "max_completion_tokens": max(900, int(max_tokens)),
     }
-    # GPT-OSS can use reasoning_effort, but omitting it is safer across model
-    # variants/projects and keeps this provider call maximally compatible.
+    if model in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}:
+        kwargs["reasoning_effort"] = "low"
     return _groq_client(key).chat.completions.create(**kwargs)
 
 def _request_deepseek(model, prompt, key, max_tokens):
@@ -769,7 +772,17 @@ def call_ai(role, data, instructions, tier="analyst", budget=None):
                         raw = _request_groq(model, prompt, key, max_tokens)
                         st.session_state["_last_ai_call"] = time.time()
                         st.session_state["_active_groq_key"] = key_index
-                        content = raw.choices[0].message.content or ""
+                        message = raw.choices[0].message
+                        content = message.content or ""
+                        if not content.strip():
+                            # Keep the diagnostic useful; do not feed hidden reasoning
+                            # into the JSON parser. The caller will try the next key.
+                            reasoning = getattr(message, "reasoning", None) or ""
+                            if reasoning:
+                                raise RuntimeError(
+                                    "Respons AI kosong (model menghasilkan reasoning tetapi tidak menghasilkan content)."
+                                )
+                            raise RuntimeError("Respons AI kosong.")
                     else:
                         content = _request_deepseek(model, prompt, key, max_tokens)
                         st.session_state["_active_deepseek_key"] = key_index
@@ -787,8 +800,8 @@ def call_ai(role, data, instructions, tier="analyst", budget=None):
                     if _is_rate_limit_error(msg):
                         _disable_key(provider, key_index, GROQ_RETRY_SECONDS if provider == "groq" else 90, "Rate limit")
                         continue
-                    if _is_auth_error(msg):
-                        _disable_key(provider, key_index, 24 * 60 * 60, "API key/auth")
+                    if _is_auth_error(msg) or "insufficient balance" in msg.lower() or "http 402" in msg.lower():
+                        _disable_key(provider, key_index, 24 * 60 * 60, "API key/balance")
                         continue
                     if _is_model_not_found(msg):
                         # Try another key/model/provider.
