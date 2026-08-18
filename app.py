@@ -454,27 +454,16 @@ DEBATE_MODEL = secret("DEBATE_MODEL") or "qwen/qwen3.6-27b"
 RESEARCH_MODEL = secret("RESEARCH_MODEL") or "openai/gpt-oss-120b"
 JUDGE_MODEL = secret("JUDGE_MODEL") or "openai/gpt-oss-120b"
 
-DEEPSEEK_MODEL = secret("DEEPSEEK_MODEL") or "deepseek-v4-flash"
 
-ANALYST_MAX_TOKENS = int(secret("ANALYST_MAX_TOKENS") or 500)
-DEBATE_MAX_TOKENS = int(secret("DEBATE_MAX_TOKENS") or 700)
-RESEARCH_MAX_TOKENS = int(secret("RESEARCH_MAX_TOKENS") or 900)
-JUDGE_MAX_TOKENS = int(secret("JUDGE_MAX_TOKENS") or 1000)
+ANALYST_MAX_TOKENS = int(secret("ANALYST_MAX_TOKENS") or 450)
+DEBATE_MAX_TOKENS = int(secret("DEBATE_MAX_TOKENS") or 550)
+RESEARCH_MAX_TOKENS = int(secret("RESEARCH_MAX_TOKENS") or 700)
+JUDGE_MAX_TOKENS = int(secret("JUDGE_MAX_TOKENS") or 750)
 
 MAX_AI_CALLS_PER_CANDIDATE = int(secret("MAX_AI_CALLS_PER_CANDIDATE") or 12)
 GROQ_MIN_DELAY = float(secret("GROQ_MIN_DELAY") or 1.0)
 GROQ_RETRY_SECONDS = float(secret("GROQ_RETRY_SECONDS") or 30.0)
-AI_PROVIDER_ORDER = [x.strip().lower() for x in
-                     (secret("AI_PROVIDER_ORDER") or "groq,deepseek").split(",")
-                     if x.strip()]
-
-# Multiple DeepSeek keys. DEEPSEEK_API_KEY is the legacy/default key.
-_DEEPSEEK_KEYS = []
-_DEEPSEEK_KEYS.extend(_parse_secret_list(secret("DEEPSEEK_API_KEY")))
-_DEEPSEEK_KEYS.extend(_parse_secret_list(secret("DEEPSEEK_API_KEYS")))
-for _i in range(1, 21):
-    _DEEPSEEK_KEYS.extend(_parse_secret_list(secret(f"DEEPSEEK_API_KEY_{_i}")))
-DEEPSEEK_KEYS = list(dict.fromkeys(k for k in _DEEPSEEK_KEYS if k))
+AI_PROVIDER_ORDER = ["groq"]
 
 MODEL_TIERS = {
     # Fast numerical/indicator interpretation.
@@ -487,19 +476,19 @@ MODEL_TIERS = {
     "debate": {
         "model": DEBATE_MODEL,
         "max_tokens": DEBATE_MAX_TOKENS,
-        "reasoning_effort": "medium",
+        "reasoning_effort": "low",
     },
     # Strong synthesis.
     "research": {
         "model": RESEARCH_MODEL,
         "max_tokens": RESEARCH_MAX_TOKENS,
-        "reasoning_effort": "medium",
+        "reasoning_effort": "low",
     },
     # Strongest final arbiter.
     "judge": {
         "model": JUDGE_MODEL,
         "max_tokens": JUDGE_MAX_TOKENS,
-        "reasoning_effort": "high",
+        "reasoning_effort": "low",
     },
 }
 
@@ -536,7 +525,7 @@ def compact_json(obj, max_chars=1400):
 def _provider_state(name):
     key = f"{name}_key_state"
     if key not in st.session_state:
-        keys = GROQ_KEYS if name == "groq" else DEEPSEEK_KEYS
+        keys = GROQ_KEYS if name == "groq" else []
         st.session_state[key] = {
             i: {"disabled_until": 0.0, "reason": "", "failures": 0}
             for i in range(len(keys))
@@ -685,21 +674,18 @@ def _groq_client(key):
     return Groq(api_key=key)
 
 def _request_groq(model, prompt, key, max_tokens, tier):
+    """Groq request with model-aware, quota-friendly structured JSON."""
     kwargs = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
-        "max_completion_tokens": max(256, int(max_tokens)),
+        "temperature": 0.1,
+        "max_completion_tokens": max(384, int(max_tokens)),
     }
 
-    # Model-aware reasoning. GPT-OSS supports low/medium/high; Qwen does not
-    # use these same values, so we deliberately omit the parameter for Qwen.
+    # GPT-OSS: strict schema is useful, but keep reasoning LOW in V5.4 so
+    # the model has enough completion budget left to actually emit the JSON.
     if model in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}:
-        # GPT-OSS supports low/medium/high reasoning.
-        effort = MODEL_TIERS[tier].get("reasoning_effort", "low")
-        kwargs["reasoning_effort"] = effort
-
-        # Strict Structured Outputs are supported by GPT-OSS 20B/120B.
+        kwargs["reasoning_effort"] = MODEL_TIERS[tier].get("reasoning_effort", "low")
         kwargs["response_format"] = {
             "type": "json_schema",
             "json_schema": {
@@ -709,60 +695,27 @@ def _request_groq(model, prompt, key, max_tokens, tier):
             },
         }
     elif model.startswith("qwen/"):
-        # Groq's Qwen 3 models use 'default'/'none' for reasoning_effort,
-        # not GPT-OSS's low/medium/high. 'default' keeps thinking enabled.
-        kwargs["reasoning_effort"] = "default"
+        # Qwen JSON mode is much more reliable with thinking disabled for
+        # short structured decisions. The model itself remains the debate tier.
+        kwargs["reasoning_effort"] = "none"
         kwargs["response_format"] = {"type": "json_object"}
     else:
-        # Other Groq models: JSON Object Mode + local validation.
         kwargs["response_format"] = {"type": "json_object"}
 
     return _groq_client(key).chat.completions.create(**kwargs)
 
-def _request_deepseek(model, prompt, key, max_tokens):
-    url = "https://api.deepseek.com/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.1,
-        "max_tokens": max_tokens,
-        # No response_format: local parser handles JSON.
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=90)
-    if r.status_code >= 400:
-        try:
-            detail = r.json()
-        except Exception:
-            detail = r.text[:500]
-        raise RuntimeError(f"HTTP {r.status_code}: {detail}")
-    body = r.json()
-    choices = body.get("choices") or []
-    if not choices:
-        raise RuntimeError("DeepSeek tidak mengembalikan choices.")
-    return choices[0].get("message", {}).get("content", "")
-
 def _ordered_key_indices(provider):
-    keys = GROQ_KEYS if provider == "groq" else DEEPSEEK_KEYS
-    if not keys:
+    if provider != "groq" or not GROQ_KEYS:
         return []
-    state_key = "_active_groq_key" if provider == "groq" else "_active_deepseek_key"
-    active = int(st.session_state.get(state_key, 0)) % len(keys)
-    return list(range(active, len(keys))) + list(range(0, active))
+    active = int(st.session_state.get("_active_groq_key", 0)) % len(GROQ_KEYS)
+    return list(range(active, len(GROQ_KEYS))) + list(range(0, active))
 
 def _provider_models(provider, tier):
-    if provider == "groq":
-        primary = MODEL_TIERS[tier]["model"]
-        # If the primary model is unavailable, use GPT-OSS 20B as a same-tier
-        # fallback where possible. The tier/reasoning setting is still preserved.
-        models = [primary]
-        if "openai/gpt-oss-20b" not in models:
-            models.append("openai/gpt-oss-20b")
-        return list(dict.fromkeys(models))
-    return [DEEPSEEK_MODEL]
+    if provider != "groq":
+        return []
+    # Do not silently downgrade a research/judge tier to 20B.
+    # A tier must mean one deliberate model family.
+    return [MODEL_TIERS[tier]["model"]]
 
 def call_ai(role, data, instructions, tier="analyst", budget=None):
     if tier not in MODEL_TIERS:
@@ -786,15 +739,12 @@ def call_ai(role, data, instructions, tier="analyst", budget=None):
     prompt = _build_prompt(role, data, instructions)
     errors = []
 
-    providers = [p for p in AI_PROVIDER_ORDER if p in {"groq", "deepseek"}]
-    # Always append configured providers if the setting was malformed/empty.
-    if GROQ_KEYS and "groq" not in providers:
-        providers.append("groq")
-    if DEEPSEEK_KEYS and "deepseek" not in providers:
-        providers.append("deepseek")
+    # V5.4 intentionally uses Groq only. DeepSeek was removed because the
+    # configured account returned HTTP 402 (Insufficient Balance).
+    providers = ["groq"] if GROQ_KEYS else []
 
     for provider in providers:
-        keys = GROQ_KEYS if provider == "groq" else DEEPSEEK_KEYS
+        keys = GROQ_KEYS
         if not keys:
             continue
 
@@ -807,28 +757,22 @@ def call_ai(role, data, instructions, tier="analyst", budget=None):
 
                 key = keys[key_index]
                 try:
-                    if provider == "groq":
-                        last = float(st.session_state.get("_last_ai_call", 0))
-                        wait = GROQ_MIN_DELAY - (time.time() - last)
-                        if wait > 0:
-                            time.sleep(wait)
-                        raw = _request_groq(model, prompt, key, max_tokens, tier)
-                        st.session_state["_last_ai_call"] = time.time()
-                        st.session_state["_active_groq_key"] = key_index
-                        message = raw.choices[0].message
-                        content = message.content or ""
-                        if not content.strip():
-                            # Keep the diagnostic useful; do not feed hidden reasoning
-                            # into the JSON parser. The caller will try the next key.
-                            reasoning = getattr(message, "reasoning", None) or ""
-                            if reasoning:
-                                raise RuntimeError(
-                                    "Respons AI kosong (model menghasilkan reasoning tetapi tidak menghasilkan content)."
-                                )
-                            raise RuntimeError("Respons AI kosong.")
-                    else:
-                        content = _request_deepseek(model, prompt, key, max_tokens)
-                        st.session_state["_active_deepseek_key"] = key_index
+                    last = float(st.session_state.get("_last_ai_call", 0))
+                    wait = GROQ_MIN_DELAY - (time.time() - last)
+                    if wait > 0:
+                        time.sleep(wait)
+                    raw = _request_groq(model, prompt, key, max_tokens, tier)
+                    st.session_state["_last_ai_call"] = time.time()
+                    st.session_state["_active_groq_key"] = key_index
+                    message = raw.choices[0].message
+                    content = message.content or ""
+                    if not content.strip():
+                        reasoning = getattr(message, "reasoning", None) or ""
+                        if reasoning:
+                            raise RuntimeError(
+                                "Respons AI kosong (reasoning ada tetapi content JSON tidak keluar)."
+                            )
+                        raise RuntimeError("Respons AI kosong.")
 
                     obj = _safe_json_from_text(content)
                     return _normalize_ai(obj, tier, provider, model)
@@ -841,12 +785,12 @@ def call_ai(role, data, instructions, tier="analyst", budget=None):
                     # Groq TPM errors often contain the phrase "limit reached";
                     # they are temporary and must NOT disable a key for 24 hours.
                     if _is_rate_limit_error(msg):
-                        _disable_key(provider, key_index, GROQ_RETRY_SECONDS if provider == "groq" else 90, "Rate limit")
+                        _disable_key(provider, key_index, GROQ_RETRY_SECONDS, "Rate limit")
                         continue
                     if _is_quota_error(msg):
                         _disable_key(provider, key_index, 24 * 60 * 60, "Quota harian")
                         continue
-                    if _is_auth_error(msg) or "insufficient balance" in msg.lower() or "http 402" in msg.lower():
+                    if _is_auth_error(msg):
                         _disable_key(provider, key_index, 24 * 60 * 60, "API key/balance")
                         continue
                     if _is_model_not_found(msg):
