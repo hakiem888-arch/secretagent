@@ -9,7 +9,7 @@ import requests
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
-from langchain_groq import ChatGroq
+from groq import Groq
 
 # ============================================================
 # AI CONSENSUS TRADING V5
@@ -416,126 +416,269 @@ def scan_markets(n=60):
     )
 
 # -------------------------
-# AI engine — V5.1 Token-Efficient Multi-Model
+# AI engine — V5.1.1 Token-Efficient Multi-Model
 # -------------------------
-# Setiap tingkat memakai model sesuai tingkat reasoning yang dibutuhkan.
-# Model dan token budget bisa diganti lewat Streamlit Secrets tanpa mengubah kode.
+# V5.1.1 fixes:
+# - reasoning_effort is sent ONLY to GPT-OSS models that support it.
+# - Strict JSON Schema is used for GPT-OSS 20B/120B.
+# - Llama debate agents use JSON Object Mode instead of reasoning_effort.
+# - Research/Judge get a larger completion budget to avoid truncated JSON.
+# - Robust JSON parsing + one retry for 429/temporary failures.
+# - Short decision packets keep token usage under control.
 ANALYST_MODEL = secret("ANALYST_MODEL") or "openai/gpt-oss-20b"
-DEBATE_MODEL = secret("DEBATE_MODEL") or "qwen/qwen3.6-27b"
+DEBATE_MODEL = secret("DEBATE_MODEL") or "llama-3.3-70b-versatile"
 RESEARCH_MODEL = secret("RESEARCH_MODEL") or "openai/gpt-oss-120b"
 JUDGE_MODEL = secret("JUDGE_MODEL") or "openai/gpt-oss-120b"
 
-ANALYST_MAX_TOKENS = int(secret("ANALYST_MAX_TOKENS") or 260)
+ANALYST_MAX_TOKENS = int(secret("ANALYST_MAX_TOKENS") or 280)
 DEBATE_MAX_TOKENS = int(secret("DEBATE_MAX_TOKENS") or 360)
-RESEARCH_MAX_TOKENS = int(secret("RESEARCH_MAX_TOKENS") or 480)
-JUDGE_MAX_TOKENS = int(secret("JUDGE_MAX_TOKENS") or 420)
+RESEARCH_MAX_TOKENS = int(secret("RESEARCH_MAX_TOKENS") or 700)
+JUDGE_MAX_TOKENS = int(secret("JUDGE_MAX_TOKENS") or 620)
 
-# Batas panggilan AI per kandidat. Ini proteksi tambahan terhadap rate-limit.
 MAX_AI_CALLS_PER_CANDIDATE = int(secret("MAX_AI_CALLS_PER_CANDIDATE") or 12)
 GROQ_MIN_DELAY = float(secret("GROQ_MIN_DELAY") or 1.0)
+GROQ_RETRY_SECONDS = float(secret("GROQ_RETRY_SECONDS") or 15)
 
+# GPT-OSS supports low/medium/high. Other models must not receive
+# reasoning_effort=low/medium/high because Groq can reject that request.
 MODEL_TIERS = {
-    "analyst": (ANALYST_MODEL, ANALYST_MAX_TOKENS, "low"),
-    "debate": (DEBATE_MODEL, DEBATE_MAX_TOKENS, "low"),
-    "research": (RESEARCH_MODEL, RESEARCH_MAX_TOKENS, "medium"),
-    "judge": (JUDGE_MODEL, JUDGE_MAX_TOKENS, "high"),
+    "analyst": {
+        "model": ANALYST_MODEL,
+        "max_tokens": ANALYST_MAX_TOKENS,
+        "reasoning_effort": "low",
+        "structured": True,
+    },
+    "debate": {
+        "model": DEBATE_MODEL,
+        "max_tokens": DEBATE_MAX_TOKENS,
+        "reasoning_effort": None,
+        "structured": False,
+    },
+    "research": {
+        "model": RESEARCH_MODEL,
+        "max_tokens": RESEARCH_MAX_TOKENS,
+        "reasoning_effort": "medium",
+        "structured": True,
+    },
+    "judge": {
+        "model": JUDGE_MODEL,
+        "max_tokens": JUDGE_MAX_TOKENS,
+        "reasoning_effort": "high",
+        "structured": True,
+    },
 }
 
+def groq_client():
+    return Groq(api_key=GROQ_KEY) if GROQ_KEY else None
+
+def is_gpt_oss(model_name):
+    return str(model_name).startswith("openai/gpt-oss-")
+
+# Strict schemas deliberately stay simple to maximize reliability and minimize tokens.
+AI_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "decision": {
+            "type": "string",
+            "enum": ["LONG", "SHORT", "WAIT"],
+        },
+        "confidence": {
+            "type": "number",
+        },
+        "reasoning": {
+            "type": "string",
+        },
+        "key_risk": {
+            "type": "string",
+        },
+        "evidence": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+    "required": [
+        "decision",
+        "confidence",
+        "reasoning",
+        "key_risk",
+        "evidence",
+    ],
+    "additionalProperties": False,
+}
 
 def model_for(tier):
-    if not GROQ_KEY:
-        return None
-    model_name, max_tokens, reasoning_effort = MODEL_TIERS[tier]
-    return ChatGroq(
-        api_key=GROQ_KEY,
-        model=model_name,
-        temperature=0.1,
-        max_tokens=max_tokens,
-        reasoning_effort=reasoning_effort,
-    )
+    cfg = MODEL_TIERS[tier]
+    return cfg["model"]
 
+def _safe_json_from_text(raw):
+    """Parse JSON defensively. Structured Outputs should make this unnecessary
+    for GPT-OSS, but it protects the app when a different model is selected."""
+    raw = (raw or "").strip()
 
-def compact_json(obj):
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
 
+    if "{" in raw and "}" in raw:
+        candidate = raw[raw.find("{"):raw.rfind("}") + 1]
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
 
-def call_ai(role, data, instructions, tier="analyst", budget=None):
-    """Satu agent = satu tugas. Output sengaja pendek dan terstruktur."""
-    m = model_for(tier)
+    raise ValueError("Respons AI bukan JSON valid atau JSON terpotong.")
 
-    if not m:
-        return {
-            "decision": "WAIT",
-            "confidence": 0,
-            "reasoning": "GROQ_API_KEY belum dikonfigurasi.",
-            "key_risk": "AI tidak tersedia.",
-        }
+def _normalize_ai(obj, tier):
+    if not isinstance(obj, dict):
+        raise ValueError("Output AI bukan object JSON.")
 
-    max_out = budget or MODEL_TIERS[tier][1]
-    prompt = f"""
+    decision = str(obj.get("decision", "WAIT")).upper()
+    if decision not in {"LONG", "SHORT", "WAIT"}:
+        decision = "WAIT"
+
+    try:
+        confidence = float(obj.get("confidence", 0) or 0)
+    except Exception:
+        confidence = 0
+
+    evidence = obj.get("evidence", [])
+    if not isinstance(evidence, list):
+        evidence = [str(evidence)] if evidence else []
+
+    return {
+        "decision": decision,
+        "confidence": max(0.0, min(100.0, confidence)),
+        "reasoning": str(obj.get("reasoning", ""))[:700],
+        "key_risk": str(obj.get("key_risk", ""))[:400],
+        "evidence": [str(x)[:180] for x in evidence[:3]],
+        "tier": tier,
+        "model": MODEL_TIERS[tier]["model"],
+    }
+
+def _build_prompt(role, data, instructions):
+    return f"""
 Kamu adalah {role} dalam sistem riset trading multi-agent.
 
-PERANMU HANYA: {instructions}
+TUGAS KHUSUSMU:
+{instructions}
 
 ATURAN:
 - Gunakan hanya data yang diberikan.
 - Jangan mengarang harga, berita, volume, indikator, atau fakta eksternal.
 - Jangan menjanjikan profit.
 - Jika bukti tidak cukup, pilih WAIT.
-- Jawab Bahasa Indonesia.
+- Jawab dalam Bahasa Indonesia.
 - Jangan mengambil alih tugas agent lain.
-- Jawaban SANGAT SINGKAT, maksimal sekitar 3 poin bukti.
+- reasoning maksimal 2 kalimat.
+- key_risk maksimal 1 kalimat.
+- evidence maksimal 3 poin dan setiap poin singkat.
+- confidence adalah angka 0 sampai 100.
 
 DATA:
 {data}
-
-Balas JSON SAJA:
-{{
-  "decision":"LONG|SHORT|WAIT",
-  "confidence":0,
-  "reasoning":"maksimal 2 kalimat",
-  "key_risk":"maksimal 1 kalimat",
-  "evidence":["maksimal 3 bukti singkat"]
-}}
 """
 
+def _request_groq(tier, prompt):
+    client = groq_client()
+    if not client:
+        raise RuntimeError("GROQ_API_KEY belum dikonfigurasi.")
+
+    cfg = MODEL_TIERS[tier]
+    model_name = cfg["model"]
+
+    kwargs = {
+        "model": model_name,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "temperature": 0.1,
+        "max_completion_tokens": cfg["max_tokens"],
+    }
+
+    # IMPORTANT:
+    # reasoning_effort is NOT placed in model_kwargs and is NOT sent to
+    # non-GPT-OSS models. This fixes the previous 400 validation errors.
+    if is_gpt_oss(model_name):
+        kwargs["reasoning_effort"] = cfg["reasoning_effort"]
+        kwargs["reasoning_format"] = "hidden"
+
+    # GPT-OSS 20B/120B support strict JSON Schema. This prevents the
+    # "Unterminated string" / malformed JSON problem seen in Research Manager.
+    if cfg["structured"] and is_gpt_oss(model_name):
+        kwargs["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "trading_agent_decision",
+                "strict": True,
+                "schema": AI_SCHEMA,
+            },
+        }
+    else:
+        # Llama and other non-structured models get basic JSON Object Mode.
+        # Do not send reasoning_effort to them.
+        kwargs["response_format"] = {"type": "json_object"}
+
+    return client.chat.completions.create(**kwargs)
+
+def call_ai(role, data, instructions, tier="analyst", budget=None):
+    """One agent, one job, compact structured output."""
+    if tier not in MODEL_TIERS:
+        tier = "analyst"
+
+    cfg = MODEL_TIERS[tier]
+
+    if not GROQ_KEY:
+        return {
+            "decision": "WAIT",
+            "confidence": 0,
+            "reasoning": "GROQ_API_KEY belum dikonfigurasi.",
+            "key_risk": "AI tidak tersedia.",
+            "evidence": [],
+            "tier": tier,
+            "model": cfg["model"],
+        }
+
+    # Per-call override is used only for lightweight Trader/Risk calls.
+    if budget:
+        cfg_for_call = dict(cfg)
+        cfg_for_call["max_tokens"] = int(budget)
+    else:
+        cfg_for_call = cfg
+
+    original_cfg = MODEL_TIERS[tier]
+    MODEL_TIERS[tier] = cfg_for_call
+
+    prompt = _build_prompt(role, data, instructions)
+
     try:
-        # Pacing mengurangi burst request pada akun dengan TPM/RPM kecil.
         last_call = st.session_state.get("_last_ai_call", 0.0)
         wait = GROQ_MIN_DELAY - (time.time() - last_call)
         if wait > 0:
             time.sleep(wait)
 
         try:
-            response = m.invoke(prompt)
+            response = _request_groq(tier, prompt)
         except Exception as first_error:
-            # Jika Groq mengembalikan 429, tunggu sebentar lalu retry sekali.
-            if "429" in str(first_error) or "rate_limit" in str(first_error).lower():
-                time.sleep(float(secret("GROQ_RETRY_SECONDS") or 15))
-                response = m.invoke(prompt)
+            msg = str(first_error)
+
+            # Retry only transient/rate-limit errors. A model/schema 400
+            # should not be retried repeatedly because it is deterministic.
+            if "429" in msg or "rate_limit" in msg.lower():
+                time.sleep(GROQ_RETRY_SECONDS)
+                response = _request_groq(tier, prompt)
             else:
                 raise
 
         st.session_state["_last_ai_call"] = time.time()
-        raw = response.content.strip()
-        if "{" in raw and "}" in raw:
-            raw = raw[raw.find("{"):raw.rfind("}") + 1]
-        obj = json.loads(raw)
-        decision = str(obj.get("decision", "WAIT")).upper()
-        if decision not in {"LONG", "SHORT", "WAIT"}:
-            decision = "WAIT"
-        evidence = obj.get("evidence", [])
-        if not isinstance(evidence, list):
-            evidence = [str(evidence)] if evidence else []
-        return {
-            "decision": decision,
-            "confidence": max(0.0, min(100.0, float(obj.get("confidence", 0) or 0))),
-            "reasoning": str(obj.get("reasoning", ""))[:500],
-            "key_risk": str(obj.get("key_risk", ""))[:300],
-            "evidence": [str(x)[:180] for x in evidence[:3]],
-            "tier": tier,
-            "model": MODEL_TIERS[tier][0],
-        }
+
+        content = response.choices[0].message.content or ""
+        obj = _safe_json_from_text(content)
+        return _normalize_ai(obj, tier)
+
     except Exception as e:
         return {
             "decision": "WAIT",
@@ -544,8 +687,10 @@ Balas JSON SAJA:
             "key_risk": "Output AI gagal diproses.",
             "evidence": [],
             "tier": tier,
-            "model": MODEL_TIERS[tier][0],
+            "model": cfg_for_call["model"],
         }
+    finally:
+        MODEL_TIERS[tier] = original_cfg
 
 # -------------------------
 # Market packet
@@ -634,7 +779,7 @@ def packet_text(packet):
     return "\n".join(lines)
 
 # -------------------------
-# V5.1 Token-Efficient orchestration
+# V5.1.1 Token-Efficient orchestration
 # -------------------------
 ANALYSTS = [
     ("🧭 Technical Analyst", "Fokus trend multi-timeframe, EMA, MACD, support/resistance, dan regime."),
@@ -1078,7 +1223,7 @@ def telegram_message(result):
     final = result["final"]
     icon = "🚀" if final == "LONG" else "🩸"
 
-    return f"""🚨 AI TRADING V5.1
+    return f"""🚨 AI TRADING V5.1.1
 
 {icon} {result['symbol']}
 SIGNAL: {final}
@@ -1108,7 +1253,7 @@ if "scan" not in st.session_state:
 if "last_result" not in st.session_state:
     st.session_state.last_result = None
 
-st.title("🧠 AI Consensus Trading V5.1")
+st.title("🧠 AI Consensus Trading V5.1.1")
 st.caption(
     "Crypto Scanner → ⚡ Analyst → 🐂 Bull ↔ 🐻 Bear → 🧠 Research → 💹 Trader → "
     "🛡️ Risk Team → 👨‍⚖️ Final Judge → Memory → Paper Trading"
@@ -1140,10 +1285,10 @@ st.sidebar.write(
     "🟢 SIAP" if GROQ_KEY else "🔴 BELUM ADA"
 )
 st.sidebar.caption("Arsitektur model: ringan → menengah → kuat → terbaik")
-st.sidebar.caption(f"⚡ Analyst: {ANALYST_MODEL} (reasoning low)")
-st.sidebar.caption(f"🧠 Bull/Bear: {DEBATE_MODEL} (reasoning low)")
-st.sidebar.caption(f"🧠🧠 Research: {RESEARCH_MODEL} (reasoning medium)")
-st.sidebar.caption(f"👨‍⚖️ Judge: {JUDGE_MODEL} (reasoning high)")
+st.sidebar.caption(f"⚡ Analyst: {ANALYST_MODEL} (GPT-OSS reasoning low)")
+st.sidebar.caption(f"🧠 Bull/Bear: {DEBATE_MODEL} (JSON mode, tanpa reasoning_effort)")
+st.sidebar.caption(f"🧠🧠 Research: {RESEARCH_MODEL} (GPT-OSS reasoning medium + strict JSON)")
+st.sidebar.caption(f"👨‍⚖️ Judge: {JUDGE_MODEL} (GPT-OSS reasoning high + strict JSON)")
 st.sidebar.caption("Output agent dipadatkan agar hemat token dan mengurangi TPM rate-limit.")
 st.sidebar.caption(f"⏱️ Jeda AI: {GROQ_MIN_DELAY:.1f}s | Retry 429: aktif")
 
@@ -1208,7 +1353,7 @@ if st.session_state.get("confirm_reset", False):
 # -------------------------
 perf = performance()
 
-st.subheader("📊 V5.1 Performance Memory")
+st.subheader("📊 V5.1.1 Performance Memory")
 
 p1, p2, p3, p4, p5 = st.columns(5)
 p1.metric("Signal Closed", perf["closed"])
@@ -1226,7 +1371,7 @@ st.divider()
 if not st.session_state.scan:
     st.info(
         "Klik **SCAN MARKET** untuk mencari kandidat crypto. "
-        "V5.1 tidak mengeksekusi order."
+        "V5.1.1 tidak mengeksekusi order."
     )
 else:
     st.subheader("🔥 Top Kandidat")
@@ -1503,7 +1648,7 @@ else:
             ):
                 signal_id = save_signal(result)
                 st.success(
-                    f"Signal tersimpan ke memory V5.1. ID: {signal_id}"
+                    f"Signal tersimpan ke memory V5.1.1. ID: {signal_id}"
                 )
 
                 if tg_on:
@@ -1578,6 +1723,6 @@ else:
     )
 
 st.caption(
-    "V5.1 adalah sistem riset/paper trading. Tidak mengeksekusi order otomatis. "
+    "V5.1.1 adalah sistem riset/paper trading. Tidak mengeksekusi order otomatis. "
     "Hasil historis tidak menjamin hasil masa depan."
 )
