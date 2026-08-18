@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 from groq import Groq
 
 # ============================================================
-# AI CONSENSUS TRADING V5.3
+# AI CONSENSUS TRADING V5.5
 # TradingAgents-style multi-agent crypto research system
 # - Binance public market data
 # - 4 specialist analysts
@@ -33,7 +33,7 @@ from groq import Groq
 # ============================================================
 
 st.set_page_config(
-    page_title="AI Consensus Trading V5",
+    page_title="AI Consensus Trading V5.5",
     page_icon="🧠",
     layout="wide",
 )
@@ -438,10 +438,10 @@ def scan_markets(n=60):
     )
 
 # -------------------------
-# AI engine — V5.3.1 Hierarchical Multi-Model Safe Mode
+# AI engine — V5.5 Hierarchical Multi-Model Safe Mode
 # Fix: pass tier into _request_groq; model-specific reasoning for Qwen/GPT-OSS.
 # -------------------------
-# V5.3 design goals:
+# V5.5 design goals:
 # - Use strict Structured Outputs for GPT-OSS where supported.
 # - Use JSON Object Mode + local validation for other models.
 # - Groq keys rotate legitimately when a key is rate-limited/quota/auth-failed.
@@ -570,7 +570,7 @@ def _is_model_not_found(message):
 
 def _build_prompt(role, data, instructions):
     # IMPORTANT: the literal word JSON is intentionally present. This is
-    # harmless because V5.3 uses model-aware response_format, but it
+    # harmless because V5.5 uses model-aware response_format, but it
     # also makes the prompt compatible if a provider enforces JSON wording.
     return f"""
 Kamu adalah {role} dalam sistem riset trading multi-agent.
@@ -682,7 +682,7 @@ def _request_groq(model, prompt, key, max_tokens, tier):
         "max_completion_tokens": max(384, int(max_tokens)),
     }
 
-    # GPT-OSS: strict schema is useful, but keep reasoning LOW in V5.4 so
+    # GPT-OSS: strict schema is useful, but keep reasoning LOW in V5.5 so
     # the model has enough completion budget left to actually emit the JSON.
     if model in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}:
         kwargs["reasoning_effort"] = MODEL_TIERS[tier].get("reasoning_effort", "low")
@@ -739,7 +739,7 @@ def call_ai(role, data, instructions, tier="analyst", budget=None):
     prompt = _build_prompt(role, data, instructions)
     errors = []
 
-    # V5.4 intentionally uses Groq only. DeepSeek was removed because the
+    # V5.5 intentionally uses Groq only. DeepSeek was removed because the
     # configured account returned HTTP 402 (Insufficient Balance).
     providers = ["groq"] if GROQ_KEYS else []
 
@@ -979,7 +979,7 @@ def memory_context(symbol, limit=5):
     )
 
 # -------------------------
-# V5.3 Hierarchical orchestration
+# V5.5 Hierarchical orchestration
 # -------------------------
 ANALYSTS = [
     ("🧭 Technical Analyst", "Fokus trend multi-timeframe, EMA, MACD, support/resistance, dan regime."),
@@ -1419,6 +1419,267 @@ def performance():
         "rows": closed,
     }
 
+
+# -------------------------
+# V5.5 Performance Lab / Trade Journal
+# -------------------------
+def journal_rows(limit=500):
+    con = db()
+    rows = con.execute(
+        """
+        SELECT * FROM signals
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    ).fetchall()
+    con.close()
+    return rows
+
+
+def performance_advanced():
+    """Return research-grade paper-trading statistics from closed signals.
+    Results are descriptive only; no claim of predictive edge is made.
+    """
+    con = db()
+    closed = con.execute(
+        """
+        SELECT * FROM signals
+        WHERE result IN ('TP','SL')
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    open_rows = con.execute(
+        """
+        SELECT * FROM signals
+        WHERE result IS NULL AND final_decision IN ('LONG','SHORT')
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    con.close()
+
+    rs = [float(r['r_multiple'] or 0) for r in closed]
+    wins = [x for x in rs if x > 0]
+    losses = [x for x in rs if x < 0]
+    total_r = sum(rs)
+    expectancy = total_r / len(rs) if rs else 0.0
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    pf = gross_profit / gross_loss if gross_loss else (float('inf') if gross_profit else 0.0)
+
+    equity = []
+    cur = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for x in rs:
+        cur += x
+        peak = max(peak, cur)
+        max_dd = min(max_dd, cur - peak)
+        equity.append(cur)
+
+    durations = []
+    for r in closed:
+        try:
+            if r['created_at'] and r['closed_at']:
+                a = datetime.fromisoformat(r['created_at'].replace('Z', '+00:00'))
+                b = datetime.fromisoformat(r['closed_at'].replace('Z', '+00:00'))
+                durations.append(max(0, (b-a).total_seconds()/3600))
+        except Exception:
+            pass
+
+    by_side = {}
+    for side in ('LONG','SHORT'):
+        vals = [float(r['r_multiple'] or 0) for r in closed if r['final_decision'] == side]
+        by_side[side] = {
+            'count': len(vals),
+            'win_rate': (sum(x > 0 for x in vals)/len(vals)*100) if vals else 0,
+            'avg_r': (sum(vals)/len(vals)) if vals else 0,
+            'total_r': sum(vals),
+        }
+
+    # Confidence calibration buckets: did higher-confidence signals actually
+    # perform better? This is descriptive, not a guarantee.
+    buckets = []
+    for lo, hi in ((50,59),(60,69),(70,79),(80,89),(90,100)):
+        vals = [float(r['r_multiple'] or 0) for r in closed if lo <= float(r['confidence'] or 0) <= hi]
+        buckets.append({
+            'bucket': f'{lo}-{hi}',
+            'count': len(vals),
+            'win_rate': (sum(x > 0 for x in vals)/len(vals)*100) if vals else 0,
+            'avg_r': (sum(vals)/len(vals)) if vals else 0,
+        })
+
+    return {
+        'closed': len(closed),
+        'open': len(open_rows),
+        'wins': len(wins),
+        'losses': len(losses),
+        'win_rate': (len(wins)/len(rs)*100) if rs else 0,
+        'avg_r': expectancy,
+        'expectancy_r': expectancy,
+        'profit_factor': pf,
+        'total_r': total_r,
+        'max_drawdown_r': abs(max_dd),
+        'avg_duration_h': sum(durations)/len(durations) if durations else 0,
+        'equity': equity,
+        'closed_rows': closed,
+        'open_rows': open_rows,
+        'by_side': by_side,
+        'confidence_buckets': buckets,
+    }
+
+
+def agent_performance():
+    """Evaluate each agent vote against the eventual paper-trade outcome."""
+    con = db()
+    rows = con.execute(
+        """
+        SELECT av.agent, av.decision, s.result, s.r_multiple
+        FROM agent_votes av
+        JOIN signals s ON s.id = av.signal_id
+        WHERE s.result IN ('TP','SL')
+        ORDER BY av.id ASC
+        """
+    ).fetchall()
+    con.close()
+
+    grouped = {}
+    for r in rows:
+        agent = r['agent']
+        grouped.setdefault(agent, []).append(r)
+
+    out = []
+    for agent, vals in grouped.items():
+        considered = [v for v in vals if v['decision'] in ('LONG','SHORT')]
+        # A directional vote is considered correct when it matches the side
+        # of the trade and the trade ultimately wins. WAIT is reported separately.
+        signal_correct = 0
+        directional = 0
+        total_r = 0.0
+        for v in vals:
+            if v['decision'] == 'WAIT':
+                continue
+            directional += 1
+            trade_won = v['result'] == 'TP'
+            signal_side = v['decision']
+            # The saved signal's side is needed to know whether the agent agreed
+            # with the executed direction. Fetch it below in a separate query.
+        out.append((agent, len(vals)))
+
+    # Better query with final side included.
+    con = db()
+    rows = con.execute(
+        """
+        SELECT av.agent, av.decision, s.final_decision, s.result, s.r_multiple
+        FROM agent_votes av
+        JOIN signals s ON s.id = av.signal_id
+        WHERE s.result IN ('TP','SL')
+        """
+    ).fetchall()
+    con.close()
+    grouped = {}
+    for r in rows:
+        grouped.setdefault(r['agent'], []).append(r)
+
+    result = []
+    for agent, vals in grouped.items():
+        non_wait = [v for v in vals if v['decision'] in ('LONG','SHORT')]
+        aligned = [v for v in non_wait if v['decision'] == v['final_decision']]
+        # Actual winning direction is derived from the executed paper trade:
+        # TP means the final side was right; SL means the opposite side was right.
+        # This lets us compare an agent's directional thesis with the observed
+        # outcome without pretending that WAIT is a directional prediction.
+        correct = 0
+        for v in non_wait:
+            actual_direction = v['final_decision'] if v['result'] == 'TP' else (
+                'SHORT' if v['final_decision'] == 'LONG' else 'LONG'
+            )
+            if v['decision'] == actual_direction:
+                correct += 1
+        avg_r = sum(float(v['r_multiple'] or 0) for v in vals) / len(vals) if vals else 0
+        result.append({
+            'agent': agent,
+            'votes': len(vals),
+            'directional_votes': len(non_wait),
+            'wait_rate': (sum(v['decision']=='WAIT' for v in vals)/len(vals)*100) if vals else 0,
+            'aligned_final': (len(aligned)/len(non_wait)*100) if non_wait else 0,
+            'outcome_accuracy': (correct/len(non_wait)*100) if non_wait else 0,
+            'avg_signal_r': avg_r,
+        })
+    return sorted(result, key=lambda x: x['outcome_accuracy'], reverse=True)
+
+
+def render_performance_lab():
+    st.subheader('🧪 V5.5 Performance Lab')
+    st.caption('Dashboard ini mengevaluasi PAPER TRADE yang sudah benar-benar ditutup. Belum ada klaim bahwa sistem memiliki edge.')
+    adv = performance_advanced()
+
+    if adv['closed'] == 0:
+        st.info('Belum ada paper trade tertutup. Jalankan analisis, simpan signal LONG/SHORT, lalu gunakan UPDATE PAPER TRADES setelah harga bergerak.')
+        if adv['open_rows']:
+            st.markdown('#### 📂 Open Paper Trades')
+            st.dataframe(pd.DataFrame([{
+                'ID': r['id'], 'Symbol': r['symbol'], 'Side': r['final_decision'],
+                'Confidence': round(float(r['confidence'] or 0)), 'Entry': r['entry'],
+                'SL': r['stop_loss'], 'TP': r['take_profit'], 'Regime': r['market_regime']
+            } for r in adv['open_rows']]), use_container_width=True, hide_index=True)
+        return
+
+    c = st.columns(7)
+    c[0].metric('Closed', adv['closed'])
+    c[1].metric('Win Rate', f"{adv['win_rate']:.1f}%")
+    c[2].metric('Expectancy', f"{adv['expectancy_r']:+.2f}R")
+    pf = '∞' if math.isinf(adv['profit_factor']) else f"{adv['profit_factor']:.2f}"
+    c[3].metric('Profit Factor', pf)
+    c[4].metric('Total R', f"{adv['total_r']:+.1f}R")
+    c[5].metric('Max DD', f"-{adv['max_drawdown_r']:.1f}R")
+    c[6].metric('Open', adv['open'])
+
+    # Equity curve
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        y=adv['equity'],
+        mode='lines+markers',
+        name='Cumulative R',
+    ))
+    fig.add_hline(y=0, line_dash='dot')
+    fig.update_layout(height=320, title='Paper Equity Curve (R)', xaxis_title='Closed Trade', yaxis_title='Cumulative R')
+    st.plotly_chart(fig, use_container_width=True)
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown('#### 📈 LONG vs SHORT')
+        st.dataframe(pd.DataFrame([
+            {'Side': side, **vals} for side, vals in adv['by_side'].items()
+        ]), use_container_width=True, hide_index=True)
+    with right:
+        st.markdown('#### 🎯 Confidence Calibration')
+        st.dataframe(pd.DataFrame(adv['confidence_buckets']), use_container_width=True, hide_index=True)
+
+    st.markdown('#### 🧠 Agent Performance')
+    agents = agent_performance()
+    if agents:
+        st.dataframe(pd.DataFrame(agents), use_container_width=True, hide_index=True)
+    else:
+        st.info('Belum cukup histori untuk mengukur performa agent.')
+
+    st.markdown('#### 📓 Trade Journal')
+    rows = []
+    for r in adv['closed_rows']:
+        rows.append({
+            'ID': r['id'],
+            'Waktu': r['created_at'][:19].replace('T',' '),
+            'Symbol': r['symbol'],
+            'Side': r['final_decision'],
+            'Confidence': round(float(r['confidence'] or 0)),
+            'Regime': r['market_regime'],
+            'Entry': r['entry'],
+            'Exit': r['exit_price'],
+            'Result': r['result'],
+            'R': float(r['r_multiple'] or 0),
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
 # -------------------------
 # Telegram
 # -------------------------
@@ -1442,7 +1703,7 @@ def telegram_message(result):
     final = result["final"]
     icon = "🚀" if final == "LONG" else "🩸"
 
-    return f"""🚨 AI TRADING V5.3
+    return f"""🚨 AI TRADING V5.5
 
 {icon} {result['symbol']}
 SIGNAL: {final}
@@ -1472,7 +1733,7 @@ if "scan" not in st.session_state:
 if "last_result" not in st.session_state:
     st.session_state.last_result = None
 
-st.title("🧠 AI Consensus Trading V5.3")
+st.title("🧠 AI Consensus Trading V5.5")
 st.caption(
     "Crypto Scanner → ⚡ Analyst → 🐂 Bull ↔ 🐻 Bear → 🧠 Research → 💹 Trader → "
     "🛡️ Risk Team → 👨‍⚖️ Final Judge → Memory → Paper Trading"
@@ -1513,9 +1774,9 @@ else:
     st.sidebar.caption("Tambahkan GROQ_API_KEY atau GROQ_API_KEYS di Streamlit Secrets.")
 st.sidebar.caption("Arsitektur model: ringan → menengah → kuat → terbaik")
 st.sidebar.caption(f"⚡ Analyst: {ANALYST_MODEL} | reasoning low")
-st.sidebar.caption(f"🧠 Bull/Bear: {DEBATE_MODEL} | debate model")
-st.sidebar.caption(f"🧠🧠 Research: {RESEARCH_MODEL} | reasoning medium + strict JSON jika didukung")
-st.sidebar.caption(f"👨‍⚖️ Judge: {JUDGE_MODEL} | reasoning high + strict JSON jika didukung")
+st.sidebar.caption(f"🧠 Bull/Bear: {DEBATE_MODEL} | structured debate")
+st.sidebar.caption(f"🧠🧠 Research: {RESEARCH_MODEL} | reasoning low + strict JSON")
+st.sidebar.caption(f"👨‍⚖️ Judge: {JUDGE_MODEL} | reasoning low + strict JSON")
 st.sidebar.caption("Output agent dipadatkan agar hemat token dan mengurangi TPM rate-limit.")
 st.sidebar.caption(f"⏱️ Jeda AI: {GROQ_MIN_DELAY:.1f}s | Retry 429: aktif")
 
@@ -1532,7 +1793,7 @@ if not TG_TOKEN or not TG_CHAT:
     )
 
 if st.sidebar.button("📨 Test Telegram", use_container_width=True):
-    ok, msg = telegram("✅ TEST AI CONSENSUS TRADING V5.3\nTelegram berhasil terhubung.")
+    ok, msg = telegram("✅ TEST AI CONSENSUS TRADING V5.5\nTelegram berhasil terhubung.")
     st.sidebar.success(msg) if ok else st.sidebar.error(msg)
 
 st.sidebar.divider()
@@ -1580,7 +1841,7 @@ if st.session_state.get("confirm_reset", False):
 # -------------------------
 perf = performance()
 
-st.subheader("📊 V5.3 Performance Memory")
+st.subheader("📊 V5.5 Performance Lab")
 
 p1, p2, p3, p4, p5 = st.columns(5)
 p1.metric("Signal Closed", perf["closed"])
@@ -1590,6 +1851,9 @@ p4.metric("Average R", f"{perf['avg_r']:+.2f}R")
 pf = "∞" if math.isinf(perf["profit_factor"]) else f"{perf['profit_factor']:.2f}"
 p5.metric("Profit Factor", pf)
 
+with st.expander("🧪 Buka V5.5 Performance Lab", expanded=True):
+    render_performance_lab()
+
 st.divider()
 
 # -------------------------
@@ -1598,7 +1862,7 @@ st.divider()
 if not st.session_state.scan:
     st.info(
         "Klik **SCAN MARKET** untuk mencari kandidat crypto. "
-        "V5.3 tidak mengeksekusi order."
+        "V5.5 tidak mengeksekusi order."
     )
 else:
     st.subheader("🔥 Top Kandidat")
@@ -1875,7 +2139,7 @@ else:
             ):
                 signal_id = save_signal(result)
                 st.success(
-                    f"Signal tersimpan ke memory V5.3. ID: {signal_id}"
+                    f"Signal tersimpan ke Trade Journal V5.5. ID: {signal_id}"
                 )
 
                 if tg_on:
@@ -1894,7 +2158,7 @@ else:
             ):
                 signal_id = save_signal(result)
                 st.success(
-                    f"WAIT tersimpan ke memory V5. ID: {signal_id}"
+                    f"WAIT tersimpan ke Trade Journal V5.5. ID: {signal_id}"
                 )
 
         with st.expander("🔍 Lihat data multi-timeframe"):
@@ -1950,6 +2214,6 @@ else:
     )
 
 st.caption(
-    "V5.3 adalah sistem riset/paper trading. Tidak mengeksekusi order otomatis. "
+    "V5.5 adalah sistem riset/paper trading. Tidak mengeksekusi order otomatis. "
     "Hasil historis tidak menjamin hasil masa depan."
 )
