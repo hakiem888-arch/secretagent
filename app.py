@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import math
 import sqlite3
@@ -51,7 +52,28 @@ def secret(key):
         pass
     return os.getenv(key, "")
 
-GROQ_KEY = secret("GROQ_API_KEY")
+def _parse_secret_list(value):
+    """Accept a single string, comma/newline separated keys, or a Streamlit list."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        raw_items = value
+    else:
+        raw_items = re.split(r"[\s,]+", str(value))
+    return [str(x).strip() for x in raw_items if str(x).strip()]
+
+
+# Multiple Groq keys can be supplied through GROQ_API_KEYS or
+# GROQ_API_KEY_1, GROQ_API_KEY_2, ... . The legacy GROQ_API_KEY still works.
+_GROQ_KEYS = []
+_GROQ_KEYS.extend(_parse_secret_list(secret("GROQ_API_KEY")))
+_GROQ_KEYS.extend(_parse_secret_list(secret("GROQ_API_KEYS")))
+for _i in range(1, 21):
+    _GROQ_KEYS.extend(_parse_secret_list(secret(f"GROQ_API_KEY_{_i}")))
+
+GROQ_KEYS = list(dict.fromkeys(k for k in _GROQ_KEYS if k))
+GROQ_KEY = GROQ_KEYS[0] if GROQ_KEYS else ""
+
 TG_TOKEN = secret("TELEGRAM_BOT_TOKEN")
 TG_CHAT = secret("TELEGRAM_CHAT_ID")
 
@@ -468,8 +490,68 @@ MODEL_TIERS = {
     },
 }
 
-def groq_client():
-    return Groq(api_key=GROQ_KEY) if GROQ_KEY else None
+def _groq_state():
+    if "groq_key_state" not in st.session_state:
+        st.session_state.groq_key_state = {
+            i: {"disabled_until": 0.0, "reason": "", "failures": 0}
+            for i in range(len(GROQ_KEYS))
+        }
+    return st.session_state.groq_key_state
+
+
+def _key_mask(key):
+    if not key:
+        return "-"
+    return f"{key[:5]}...{key[-4:]}" if len(key) > 12 else "***"
+
+
+def _key_disabled(index):
+    state = _groq_state().get(index, {})
+    return float(state.get("disabled_until", 0)) > time.time()
+
+
+def _disable_key(index, seconds, reason):
+    state = _groq_state().setdefault(
+        index, {"disabled_until": 0.0, "reason": "", "failures": 0}
+    )
+    state["disabled_until"] = time.time() + seconds
+    state["reason"] = reason[:180]
+    state["failures"] = int(state.get("failures", 0)) + 1
+
+
+def _is_quota_error(message):
+    msg = str(message).lower()
+    return any(term in msg for term in (
+        "tokens per day",
+        "requests per day",
+        "daily limit",
+        "daily quota",
+        "quota exceeded",
+        "quota has been exceeded",
+        "insufficient_quota",
+        "limit reached",
+        "billing",
+    ))
+
+
+def _is_rate_limit_error(message):
+    msg = str(message).lower()
+    return "429" in msg or "rate_limit" in msg or "rate limit" in msg
+
+
+def _is_auth_error(message):
+    msg = str(message).lower()
+    return (
+        "401" in msg or "403" in msg
+        or "invalid api key" in msg
+        or "authentication" in msg
+    )
+
+
+def groq_client(api_key=None):
+    key = api_key or GROQ_KEY
+    return Groq(api_key=key) if key else None
+
 
 def is_gpt_oss(model_name):
     return str(model_name).startswith("openai/gpt-oss-")
@@ -509,6 +591,25 @@ AI_SCHEMA = {
 def model_for(tier):
     cfg = MODEL_TIERS[tier]
     return cfg["model"]
+
+def compact_json(obj, max_chars=1400):
+    """Compact an agent result before passing it to another agent."""
+    if isinstance(obj, dict):
+        evidence = obj.get("evidence", [])
+        if not isinstance(evidence, list):
+            evidence = [str(evidence)] if evidence else []
+        payload = {
+            "decision": obj.get("decision", "WAIT"),
+            "confidence": obj.get("confidence", 0),
+            "reasoning": obj.get("reasoning", ""),
+            "key_risk": obj.get("key_risk", ""),
+            "evidence": evidence[:3],
+        }
+    else:
+        payload = obj
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return text[:max_chars]
+
 
 def _safe_json_from_text(raw):
     """Parse JSON defensively. Structured Outputs should make this unnecessary
@@ -579,8 +680,8 @@ DATA:
 {data}
 """
 
-def _request_groq(tier, prompt):
-    client = groq_client()
+def _request_groq(tier, prompt, api_key=None):
+    client = groq_client(api_key)
     if not client:
         raise RuntimeError("GROQ_API_KEY belum dikonfigurasi.")
 
@@ -625,72 +726,114 @@ def _request_groq(tier, prompt):
     return client.chat.completions.create(**kwargs)
 
 def call_ai(role, data, instructions, tier="analyst", budget=None):
-    """One agent, one job, compact structured output."""
+    """Call one AI agent with automatic Groq API-key failover."""
     if tier not in MODEL_TIERS:
         tier = "analyst"
 
     cfg = MODEL_TIERS[tier]
 
-    if not GROQ_KEY:
+    if not GROQ_KEYS:
         return {
             "decision": "WAIT",
             "confidence": 0,
-            "reasoning": "GROQ_API_KEY belum dikonfigurasi.",
+            "reasoning": "Tidak ada GROQ API key yang dikonfigurasi.",
             "key_risk": "AI tidak tersedia.",
             "evidence": [],
             "tier": tier,
             "model": cfg["model"],
         }
 
-    # Per-call override is used only for lightweight Trader/Risk calls.
+    calls_used = int(st.session_state.get("_ai_calls_current_candidate", 0))
+    if calls_used >= MAX_AI_CALLS_PER_CANDIDATE:
+        return {
+            "decision": "WAIT",
+            "confidence": 0,
+            "reasoning": "Batas panggilan AI per kandidat tercapai.",
+            "key_risk": "Perlu menghemat quota API.",
+            "evidence": [],
+            "tier": tier,
+            "model": cfg["model"],
+        }
+    st.session_state["_ai_calls_current_candidate"] = calls_used + 1
+
+    cfg_for_call = dict(cfg)
     if budget:
-        cfg_for_call = dict(cfg)
         cfg_for_call["max_tokens"] = int(budget)
-    else:
-        cfg_for_call = cfg
 
     original_cfg = MODEL_TIERS[tier]
     MODEL_TIERS[tier] = cfg_for_call
-
     prompt = _build_prompt(role, data, instructions)
 
+    errors = []
+
     try:
-        last_call = st.session_state.get("_last_ai_call", 0.0)
-        wait = GROQ_MIN_DELAY - (time.time() - last_call)
-        if wait > 0:
-            time.sleep(wait)
+        state = _groq_state()
+        active = int(st.session_state.get("_groq_active_key", 0)) % len(GROQ_KEYS)
+        ordered = list(range(active, len(GROQ_KEYS))) + list(range(0, active))
 
-        try:
-            response = _request_groq(tier, prompt)
-        except Exception as first_error:
-            msg = str(first_error)
+        for key_index in ordered:
+            if _key_disabled(key_index):
+                continue
 
-            # Retry only transient/rate-limit errors. A model/schema 400
-            # should not be retried repeatedly because it is deterministic.
-            if "429" in msg or "rate_limit" in msg.lower():
-                time.sleep(GROQ_RETRY_SECONDS)
-                response = _request_groq(tier, prompt)
-            else:
+            key = GROQ_KEYS[key_index]
+
+            last_call = st.session_state.get("_last_ai_call", 0.0)
+            wait = GROQ_MIN_DELAY - (time.time() - last_call)
+            if wait > 0:
+                time.sleep(wait)
+
+            try:
+                response = _request_groq(tier, prompt, api_key=key)
+                st.session_state["_last_ai_call"] = time.time()
+                st.session_state["_groq_active_key"] = key_index
+
+                content = response.choices[0].message.content or ""
+                obj = _safe_json_from_text(content)
+                return _normalize_ai(obj, tier)
+
+            except Exception as e:
+                msg = str(e)
+                errors.append(f"{_key_mask(key)}: {msg[:220]}")
+
+                if _is_quota_error(msg):
+                    # Do not use multiple keys to bypass a provider/org daily quota.
+                    # Groq documents RPD/TPD at the organization level.
+                    _disable_key(key_index, 24 * 60 * 60, "Quota harian")
+                    raise RuntimeError(
+                        f"Quota harian Groq habis untuk key {_key_mask(key)}. "
+                        "Tambahkan kapasitas/provider yang sah atau tunggu reset."
+                    )
+
+                if _is_rate_limit_error(msg):
+                    _disable_key(key_index, max(60, GROQ_RETRY_SECONDS), "Rate limit")
+                    continue
+
+                if _is_auth_error(msg):
+                    _disable_key(key_index, 24 * 60 * 60, "API key invalid/auth")
+                    continue
+
+                # 400/model/schema/JSON errors are not normally fixed by
+                # changing credentials, so expose the actual error.
                 raise
 
-        st.session_state["_last_ai_call"] = time.time()
-
-        content = response.choices[0].message.content or ""
-        obj = _safe_json_from_text(content)
-        return _normalize_ai(obj, tier)
+        raise RuntimeError(
+            "Semua Groq API key sedang tidak tersedia/rate-limited. "
+            + " | ".join(errors[-4:])
+        )
 
     except Exception as e:
         return {
             "decision": "WAIT",
             "confidence": 0,
             "reasoning": f"AI gagal menghasilkan JSON: {e}",
-            "key_risk": "Output AI gagal diproses.",
+            "key_risk": "Output AI gagal diproses atau quota API habis.",
             "evidence": [],
             "tier": tier,
             "model": cfg_for_call["model"],
         }
     finally:
         MODEL_TIERS[tier] = original_cfg
+
 
 # -------------------------
 # Market packet
@@ -817,6 +960,7 @@ def risk_summary_text(items):
 
 
 def run_multi_agent(symbol, scanner_score_value):
+    st.session_state["_ai_calls_current_candidate"] = 0
     frames, packet = market_packet(symbol)
     data = packet_text(packet)
 
@@ -1282,8 +1426,16 @@ st.sidebar.divider()
 st.sidebar.header("🤖 AI")
 st.sidebar.write(
     "Groq:",
-    "🟢 SIAP" if GROQ_KEY else "🔴 BELUM ADA"
+    "🟢 SIAP" if GROQ_KEYS else "🔴 BELUM ADA"
 )
+if GROQ_KEYS:
+    active_key = int(st.session_state.get("_groq_active_key", 0)) % len(GROQ_KEYS)
+    available = sum(not _key_disabled(i) for i in range(len(GROQ_KEYS)))
+    st.sidebar.caption(
+        f"🔑 API keys: {len(GROQ_KEYS)} | tersedia sekarang: {available} | aktif: #{active_key + 1}"
+    )
+else:
+    st.sidebar.caption("Tambahkan GROQ_API_KEY atau GROQ_API_KEYS di Streamlit Secrets.")
 st.sidebar.caption("Arsitektur model: ringan → menengah → kuat → terbaik")
 st.sidebar.caption(f"⚡ Analyst: {ANALYST_MODEL} (GPT-OSS reasoning low)")
 st.sidebar.caption(f"🧠 Bull/Bear: {DEBATE_MODEL} (JSON mode, tanpa reasoning_effort)")
