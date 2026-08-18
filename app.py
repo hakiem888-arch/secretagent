@@ -451,7 +451,7 @@ def model_for(tier):
         model=model_name,
         temperature=0.1,
         max_tokens=max_tokens,
-        model_kwargs={"reasoning_effort": reasoning_effort},
+        reasoning_effort=reasoning_effort,
     )
 
 
