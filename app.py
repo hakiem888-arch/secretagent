@@ -1378,7 +1378,7 @@ if "scan" not in st.session_state:
 if "last_result" not in st.session_state:
     st.session_state.last_result = None
 
-st.title("🧠 AI Consensus Trading V5.1.1")
+st.title("🧠 AI Consensus Trading V5.2")
 st.caption(
     "Crypto Scanner → ⚡ Analyst → 🐂 Bull ↔ 🐻 Bear → 🧠 Research → 💹 Trader → "
     "🛡️ Risk Team → 👨‍⚖️ Final Judge → Memory → Paper Trading"
@@ -1410,8 +1410,8 @@ st.sidebar.write(
     "🟢 SIAP" if GROQ_KEYS else "🔴 BELUM ADA"
 )
 if GROQ_KEYS:
-    active_key = int(st.session_state.get("_groq_active_key", 0)) % len(GROQ_KEYS)
-    available = sum(not _key_disabled(i) for i in range(len(GROQ_KEYS)))
+    active_key = int(st.session_state.get("_active_groq_key", 0)) % len(GROQ_KEYS)
+    available = sum(not _key_disabled("groq", i) for i in range(len(GROQ_KEYS)))
     st.sidebar.caption(
         f"🔑 API keys: {len(GROQ_KEYS)} | tersedia sekarang: {available} | aktif: #{active_key + 1}"
     )
@@ -1419,9 +1419,9 @@ else:
     st.sidebar.caption("Tambahkan GROQ_API_KEY atau GROQ_API_KEYS di Streamlit Secrets.")
 st.sidebar.caption("Arsitektur model: ringan → menengah → kuat → terbaik")
 st.sidebar.caption(f"⚡ Analyst: {ANALYST_MODEL} (GPT-OSS reasoning low)")
-st.sidebar.caption(f"🧠 Bull/Bear: {DEBATE_MODEL} (JSON mode, tanpa reasoning_effort)")
-st.sidebar.caption(f"🧠🧠 Research: {RESEARCH_MODEL} (GPT-OSS reasoning medium + strict JSON)")
-st.sidebar.caption(f"👨‍⚖️ Judge: {JUDGE_MODEL} (GPT-OSS reasoning high + strict JSON)")
+st.sidebar.caption(f"🧠 Bull/Bear: {DEBATE_MODEL} (plain-text JSON, local parser)")
+st.sidebar.caption(f"🧠🧠 Research: {RESEARCH_MODEL} (plain-text JSON, local parser)")
+st.sidebar.caption(f"👨‍⚖️ Judge: {JUDGE_MODEL} (plain-text JSON, local parser)")
 st.sidebar.caption("Output agent dipadatkan agar hemat token dan mengurangi TPM rate-limit.")
 st.sidebar.caption(f"⏱️ Jeda AI: {GROQ_MIN_DELAY:.1f}s | Retry 429: aktif")
 
