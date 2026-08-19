@@ -33,7 +33,7 @@ from groq import Groq
 # ============================================================
 
 st.set_page_config(
-    page_title="AI Consensus Trading V5.5",
+    page_title="AI Consensus Trading V5.6",
     page_icon="🧠",
     layout="wide",
 )
@@ -126,6 +126,18 @@ def init_db():
         memory_type TEXT NOT NULL,
         content TEXT NOT NULL,
         signal_id INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS pattern_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        state TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        score REAL NOT NULL,
+        fingerprint TEXT NOT NULL,
+        notified INTEGER DEFAULT 0
     );
     """)
     con.commit()
@@ -882,6 +894,42 @@ AI_SCHEMA = {
             "type": "array",
             "items": {"type": "string"},
         },
+        "modes": {
+            "type": "object",
+            "properties": {
+                "scalping": {
+                    "type": "object",
+                    "properties": {
+                        "decision": {"type": "string", "enum": ["LONG", "SHORT", "WAIT"]},
+                        "confidence": {"type": "number"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["decision", "confidence", "reason"],
+                    "additionalProperties": False,
+                },
+                "intraday": {
+                    "type": "object",
+                    "properties": {
+                        "decision": {"type": "string", "enum": ["LONG", "SHORT", "WAIT"]},
+                        "confidence": {"type": "number"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["decision", "confidence", "reason"],
+                    "additionalProperties": False,
+                },
+                "swing": {
+                    "type": "object",
+                    "properties": {
+                        "decision": {"type": "string", "enum": ["LONG", "SHORT", "WAIT"]},
+                        "confidence": {"type": "number"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["decision", "confidence", "reason"],
+                    "additionalProperties": False,
+                },
+            },
+            "additionalProperties": False,
+        },
     },
     "required": ["decision", "confidence", "reasoning", "key_risk", "evidence"],
     "additionalProperties": False,
@@ -1038,12 +1086,32 @@ def _normalize_ai(obj, tier, provider="unknown", model=None):
     if not isinstance(evidence, list):
         evidence = [str(evidence)] if evidence else []
 
+    modes = obj.get("modes")
+    normalized_modes = {}
+    if isinstance(modes, dict):
+        for mode_name in ("scalping", "intraday", "swing"):
+            m = modes.get(mode_name)
+            if isinstance(m, dict):
+                md = str(m.get("decision", "WAIT")).upper().strip()
+                if md not in {"LONG", "SHORT", "WAIT"}:
+                    md = "WAIT"
+                try:
+                    mc = float(m.get("confidence", 0) or 0)
+                except Exception:
+                    mc = 0.0
+                normalized_modes[mode_name] = {
+                    "decision": md,
+                    "confidence": max(0.0, min(100.0, mc)),
+                    "reason": str(m.get("reason", ""))[:240],
+                }
+
     return {
         "decision": decision,
         "confidence": max(0.0, min(100.0, confidence)),
         "reasoning": str(obj.get("reasoning", ""))[:700],
         "key_risk": str(obj.get("key_risk", ""))[:400],
         "evidence": [str(x)[:180] for x in evidence[:3]],
+        "modes": normalized_modes,
         "tier": tier,
         "provider": provider,
         "model": model or MODEL_TIERS[tier]["model"],
@@ -1513,7 +1581,7 @@ def run_multi_agent(symbol, scanner_score_value):
     portfolio = call_ai(
         "👨‍⚖️ Final Judge",
         judge_input,
-        "Ambil keputusan final LONG/SHORT/WAIT. Jangan voting mayoritas secara buta. Prioritaskan structure, liquidity, OB/FVG quality, displacement, entry zone, entry timing, konflik timeframe, Bull vs Bear, research, trader plan, risk team, spread, regime, dan risk/reward. SIGNAL boleh benar tetapi ENTRY harus tetap WAIT jika belum retest/trigger atau sudah LATE.",
+        "Ambil keputusan final LONG/SHORT/WAIT. Jangan voting mayoritas secara buta. Prioritaskan structure, liquidity, OB/FVG quality, displacement, entry zone, entry timing, konflik timeframe, Bull vs Bear, research, trader plan, risk team, spread, regime, dan risk/reward. SIGNAL boleh benar tetapi ENTRY harus tetap WAIT jika belum retest/trigger atau sudah LATE. Selain keputusan utama, WAJIB isi modes untuk tiga gaya: scalping memakai 1H→15M→5M, intraday memakai 4H/1H→15M→5M/15M (gunakan data yang tersedia dan nyatakan keterbatasannya), swing memakai 1D/4H→1H→15M/1H. Jangan mengarang timeframe yang tidak diberikan.",
         tier="judge",
     )
 
@@ -1572,6 +1640,12 @@ def run_multi_agent(symbol, scanner_score_value):
         tp = None
     rr = 2.0 if final in {"LONG", "SHORT"} else 0.0
 
+    mode_decisions = portfolio.get("modes") or {}
+    if not all(k in mode_decisions for k in ("scalping", "intraday", "swing")):
+        mode_decisions = mode_fallback({
+            "packet": packet, "final": final, "portfolio": portfolio
+        })
+
     return {
         "symbol": symbol,
         "frames": frames,
@@ -1583,6 +1657,7 @@ def run_multi_agent(symbol, scanner_score_value):
         "trader": trader,
         "risk_agents": risk_agents,
         "portfolio": portfolio,
+        "modes": mode_decisions,
         "final": final,
         "scanner_score": scanner_score_value,
         "entry": current if final != "WAIT" else None,
@@ -1884,6 +1959,164 @@ SCANNER: {result['scanner_score']}/100
 ⚠️ Paper-analysis only. Tidak ada order otomatis."""
 
 # -------------------------
+# V5.6 Pattern & Momentum Engine
+# -------------------------
+def _pattern_score(frames):
+    """Fast deterministic radar. It never opens a trade by itself."""
+    s5, s15, s1h = (frames["5m"]["smc"], frames["15m"]["smc"], frames["1h"]["smc"])
+    score_long = 0
+    score_short = 0
+    evidence_long = []
+    evidence_short = []
+
+    def add(direction, points, text):
+        nonlocal score_long, score_short
+        if direction == "LONG":
+            score_long += points; evidence_long.append(text)
+        elif direction == "SHORT":
+            score_short += points; evidence_short.append(text)
+
+    # Higher-timeframe bias is context, not an entry trigger.
+    if s1h["structure"]["bias"] == "BULLISH": add("LONG", 15, "1H structure bullish")
+    if s1h["structure"]["bias"] == "BEARISH": add("SHORT", 15, "1H structure bearish")
+    if s15["structure"]["bias"] == "BULLISH": add("LONG", 15, "15M structure bullish")
+    if s15["structure"]["bias"] == "BEARISH": add("SHORT", 15, "15M structure bearish")
+
+    if s15["structure"]["bos"] == "BULLISH BOS": add("LONG", 12, "15M bullish BOS")
+    if s15["structure"]["bos"] == "BEARISH BOS": add("SHORT", 12, "15M bearish BOS")
+    if s5["structure"]["choch"] == "BULLISH CHOCH": add("LONG", 14, "5M bullish CHOCH")
+    if s5["structure"]["choch"] == "BEARISH CHOCH": add("SHORT", 14, "5M bearish CHOCH")
+    if s5["liquidity"].get("sweep_low"): add("LONG", 15, "5M sell-side liquidity sweep")
+    if s5["liquidity"].get("sweep_high"): add("SHORT", 15, "5M buy-side liquidity sweep")
+    if s5.get("bullish_trigger"): add("LONG", 18, "5M bullish trigger")
+    if s5.get("bearish_trigger"): add("SHORT", 18, "5M bearish trigger")
+    if s15["bullish_entry"]["confluence"]: add("LONG", 8, "15M OB + FVG confluence")
+    if s15["bearish_entry"]["confluence"]: add("SHORT", 8, "15M OB + FVG confluence")
+    if s5["displacement"]["bullish"]: add("LONG", 8, "5M bullish displacement")
+    if s5["displacement"]["bearish"]: add("SHORT", 8, "5M bearish displacement")
+
+    long_score = min(100, score_long)
+    short_score = min(100, score_short)
+    if max(long_score, short_score) < 42:
+        state = "QUIET"
+        direction = "WAIT"
+        score = max(long_score, short_score)
+    else:
+        direction = "LONG" if long_score >= short_score else "SHORT"
+        score = max(long_score, short_score)
+        if score >= 78 and ((direction == "LONG" and s5.get("bullish_trigger")) or (direction == "SHORT" and s5.get("bearish_trigger"))):
+            state = "TRIGGERED"
+        elif score >= 60:
+            state = "DEVELOPING"
+        else:
+            state = "WATCH"
+
+    return {
+        "state": state,
+        "direction": direction,
+        "score": int(score),
+        "long_score": int(long_score),
+        "short_score": int(short_score),
+        "evidence": (evidence_long if direction == "LONG" else evidence_short)[:6],
+        "scalping": {"bias": s1h["structure"]["bias"], "setup": s15["structure"]["bias"], "trigger": s5["timing"]},
+        "intraday": {"bias": s1h["structure"]["bias"], "setup": s15["structure"]["bias"], "trigger": s5["timing"]},
+        "swing": {"bias": s1h["structure"]["bias"], "setup": s1h["timing"], "trigger": s15["timing"]},
+    }
+
+def pattern_snapshot(symbol):
+    frames = {
+        "5m": klines(symbol, "5m", 120),
+        "15m": klines(symbol, "15m", 140),
+        "1h": klines(symbol, "1h", 140),
+    }
+    smcs = {tf: smc_analysis(df) for tf, df in frames.items()}
+    signal = _pattern_score({tf: {"smc": smcs[tf]} for tf in smcs})
+    price = float(frames["5m"].iloc[-1].Close)
+    return {"symbol": symbol, "frames": frames, "smc": smcs, "pattern": signal, "price": price}
+
+def momentum_candidates(n=8):
+    tickers = bget("/api/v3/ticker/24hr")
+    pool = []
+    stable_like = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "USDE"}
+    for t in tickers:
+        symbol = t.get("symbol", "")
+        if not symbol.endswith("USDT") or symbol[:-4] in stable_like:
+            continue
+        qvol = float(t.get("quoteVolume", 0) or 0)
+        if qvol < 3_000_000:
+            continue
+        change = float(t.get("priceChangePercent", 0) or 0)
+        # Prefer liquid, active pairs but don't require a huge 24h move.
+        activity = min(qvol / 20_000_000, 5) * 10 + min(abs(change), 10) * 2
+        pool.append((symbol, qvol, change, activity))
+    pool.sort(key=lambda x: x[3], reverse=True)
+    out = []
+    for symbol, qvol, change, _ in pool[:max(n, 1)]:
+        try:
+            snap = pattern_snapshot(symbol)
+            snap["qvol"] = qvol
+            snap["change"] = change
+            out.append(snap)
+        except Exception:
+            continue
+    return sorted(out, key=lambda x: x["pattern"]["score"], reverse=True)
+
+def pattern_fingerprint(snap):
+    p = snap["pattern"]
+    s5 = snap["smc"]["5m"]
+    s15 = snap["smc"]["15m"]
+    return "|".join([
+        snap["symbol"], p["state"], p["direction"], str(p["score"]),
+        s5["timing"], s15["timing"],
+        str(s5["structure"]["bos"]), str(s5["structure"]["choch"]),
+    ])
+
+def save_pattern_event(snap, mode="scalping", notified=0):
+    p = snap["pattern"]
+    fp = pattern_fingerprint(snap)
+    now = datetime.now(timezone.utc).isoformat()
+    con = db()
+    row = con.execute("SELECT id, notified FROM pattern_events WHERE fingerprint=? ORDER BY id DESC LIMIT 1", (fp,)).fetchone()
+    if row:
+        con.close()
+        return row["id"], bool(row["notified"])
+    cur = con.execute(
+        "INSERT INTO pattern_events(created_at,symbol,mode,state,direction,score,fingerprint,notified) VALUES(?,?,?,?,?,?,?,?)",
+        (now, snap["symbol"], mode, p["state"], p["direction"], p["score"], fp, int(notified)),
+    )
+    con.commit(); con.close()
+    return cur.lastrowid, bool(notified)
+
+def mark_pattern_notified(event_id):
+    con = db(); con.execute("UPDATE pattern_events SET notified=1 WHERE id=?", (event_id,)); con.commit(); con.close()
+
+def pattern_alert_message(snap):
+    p = snap["pattern"]
+    s5, s15, s1h = snap["smc"]["5m"], snap["smc"]["15m"], snap["smc"]["1h"]
+    return f"""🚨 V5.6 MOMENTUM ALERT\n\n{snap['symbol']} — {p['state']}\nDirection: {p['direction']}\nRadar score: {p['score']}/100\nPrice: ${snap['price']:.8f}\n\n⚡ Scalping: 1H {s1h['structure']['bias']} → 15M {s15['structure']['bias']} → 5M {s5['timing']}\n📊 Intraday: 1H {s1h['structure']['bias']} → 15M {s15['structure']['bias']}\n🌊 Swing: 1H {s1h['structure']['bias']}\n\nEvidence:\n" + "\n".join(f"• {x}" for x in p['evidence']) + "\n\n⚠️ Radar only — AI council masih harus memvalidasi sebelum paper trade."""
+
+def mode_fallback(result):
+    """Fallback if Final Judge omits optional mode object."""
+    smc = result["packet"]["smc_by_tf"]
+    final = result["final"]
+    conf = float(result["portfolio"].get("confidence", 0))
+    def mode(mode_name):
+        if mode_name == "scalping":
+            bias, setup, timing = smc["1h"]["structure"]["bias"], smc["15m"]["structure"]["bias"], smc["5m"]["timing"]
+        elif mode_name == "intraday":
+            bias, setup, timing = smc["1h"]["structure"]["bias"], smc["15m"]["structure"]["bias"], smc["15m"]["timing"]
+        else:
+            bias, setup, timing = smc["1h"]["structure"]["bias"], smc["1h"]["structure"]["bias"], smc["1h"]["timing"]
+        if timing.startswith("READY") and ((bias == "BULLISH" and setup == "BULLISH") or (bias == "BEARISH" and setup == "BEARISH")):
+            d = "LONG" if bias == "BULLISH" else "SHORT"
+        elif bias == "BULLISH" and setup == "BULLISH": d = "LONG" if mode_name != "scalping" else "WAIT"
+        elif bias == "BEARISH" and setup == "BEARISH": d = "SHORT" if mode_name != "scalping" else "WAIT"
+        else: d = "WAIT"
+        if mode_name == "scalping" and final in {"LONG", "SHORT"} and d == final: d = final
+        return {"decision": d, "confidence": conf if d != "WAIT" else max(0, conf-15), "reason": f"Bias {bias}; setup {setup}; timing {timing}."}
+    return {m: mode(m) for m in ("scalping", "intraday", "swing")}
+
+# -------------------------
 # UI
 # -------------------------
 if "scan" not in st.session_state:
@@ -1894,8 +2127,8 @@ if "last_result" not in st.session_state:
 
 st.title("🧠 AI Consensus Trading V5.5")
 st.caption(
-    "Crypto Scanner → 🏗️ Structure/Liquidity/OB-FVG/Execution → 🐂 Bull ↔ 🐻 Bear → "
-    "🧠 Research → 💹 Trader → 🛡️ Risk Team → 👨‍⚖️ Final Judge → Timing Gate → Paper Trading"
+    "Crypto Scanner → 🚨 Pattern Radar → 🏗️ Structure/Liquidity/OB-FVG/Execution → 🐂 Bull ↔ 🐻 Bear → "
+    "🧠 Research → 💹 Trader → 🛡️ Risk Team → 👨‍⚖️ Final Judge → 3 Trading Modes → Paper Trading"
 )
 
 st.sidebar.header("🔎 Market Scanner")
@@ -1931,7 +2164,7 @@ if GROQ_KEYS:
     )
 else:
     st.sidebar.caption("Tambahkan GROQ_API_KEY atau GROQ_API_KEYS di Streamlit Secrets.")
-st.sidebar.caption("Arsitektur model: ringan → menengah → kuat → terbaik")
+st.sidebar.caption("V5.6: Radar pola cepat → AI hanya dipanggil saat setup menarik")
 st.sidebar.caption(f"⚡ Analysts: {ANALYST_MODEL} | reasoning low")
 st.sidebar.caption(f"🐂🐻 Bull/Bear: {DEBATE_MODEL} | reasoning none")
 st.sidebar.caption(f"🧠 Research: {RESEARCH_MODEL} | reasoning low + strict JSON")
@@ -2025,6 +2258,124 @@ if latest_smc:
     q1.metric("Latest SMC Score", f"{float(latest_smc['smc_score'] or 0):.0f}/100")
     q2.metric("Entry Timing", latest_smc["entry_status"] or "-")
     q3.metric("SMC Bias", latest_smc["smc_bias"] or "-")
+
+st.divider()
+
+# -------------------------
+# V5.6 Momentum Monitor
+# -------------------------
+st.subheader("🚨 V5.6 Pattern & Momentum Monitor")
+st.caption("Radar Python mencari pola lebih dulu. AI Council hanya dipanggil ketika setup cukup menarik; semua trade tetap PAPER.")
+mc1, mc2, mc3 = st.columns(3)
+monitor_n = mc1.slider("Pasangan yang dimonitor", 4, 12, 8, key="v56_monitor_n")
+monitor_auto = mc2.checkbox("🔄 Auto monitor", value=False, key="v56_auto")
+monitor_interval = mc3.selectbox("Interval", [30, 45, 60, 90], index=1, format_func=lambda x: f"{x} detik", key="v56_interval")
+max_validations = st.slider("Maksimal validasi AI per siklus", 1, 2, 1, key="v56_max_ai")
+
+
+def _run_v56_monitor():
+    if "v56_processed_fingerprints" not in st.session_state:
+        st.session_state.v56_processed_fingerprints = set()
+    with st.spinner("📡 Mencari pola BOS/CHOCH + liquidity + OB/FVG + displacement..."):
+        snaps = momentum_candidates(monitor_n)
+    if not snaps:
+        st.warning("Belum menemukan pasangan dengan data yang cukup.")
+        return
+    rows = []
+    for snap in snaps:
+        p = snap["pattern"]
+        rows.append({
+            "Symbol": snap["symbol"],
+            "State": p["state"],
+            "Direction": p["direction"],
+            "Score": p["score"],
+            "5M": snap["smc"]["5m"]["timing"],
+            "15M": snap["smc"]["15m"]["timing"],
+            "1H": snap["smc"]["1h"]["structure"]["bias"],
+            "24h": f"{snap['change']:+.2f}%",
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    interesting = [x for x in snaps if x["pattern"]["state"] in {"DEVELOPING", "TRIGGERED"}]
+    if not interesting:
+        st.info("👀 Belum ada setup yang cukup kuat. Sistem tetap memonitor; tidak memaksa entry.")
+        return
+
+    st.markdown("### 🎯 Setup yang sedang berkembang")
+    validations = 0
+    for snap in interesting:
+        if validations >= max_validations:
+            break
+        p = snap["pattern"]
+        icon = "🔥" if p["state"] == "TRIGGERED" else "⚠️"
+        st.markdown(f"#### {icon} {snap['symbol']} — {p['state']} {p['score']}/100 — {p['direction']}")
+        st.caption(" • ".join(p["evidence"][:6]))
+        event_id, already_notified = save_pattern_event(snap)
+        fp = pattern_fingerprint(snap)
+        if fp in st.session_state.v56_processed_fingerprints:
+            st.info("Pattern ini sudah diproses pada siklus sebelumnya; menunggu perubahan struktur.")
+            continue
+
+        # Do not repeatedly spend AI quota on the exact same pattern fingerprint.
+        con = db()
+        event_row = con.execute("SELECT notified FROM pattern_events WHERE id=?", (event_id,)).fetchone()
+        con.close()
+        if event_row and event_row["notified"] and p["state"] == "TRIGGERED":
+            st.info("Pattern ini sudah divalidasi/di-alert sebelumnya; menunggu fingerprint baru.")
+            continue
+
+        # AI is called only for interesting setups, not for the whole market.
+        if p["state"] == "TRIGGERED" and GROQ_KEYS:
+            try:
+                result = run_multi_agent(snap["symbol"], p["score"])
+                validations += 1
+                st.session_state.v56_processed_fingerprints.add(fp)
+                st.session_state.last_result = result
+                modes = result.get("modes", {})
+                cols = st.columns(3)
+                labels = [("scalping", "⚡ Scalping"), ("intraday", "📊 Intraday"), ("swing", "🌊 Swing")]
+                for col, (key, label) in zip(cols, labels):
+                    m = modes.get(key, {"decision":"WAIT", "confidence":0, "reason":"-"})
+                    if m["decision"] == "LONG": col.success(f"**{label} — LONG**\n\n{m['confidence']:.0f}%\n\n{m['reason']}")
+                    elif m["decision"] == "SHORT": col.error(f"**{label} — SHORT**\n\n{m['confidence']:.0f}%\n\n{m['reason']}")
+                    else: col.warning(f"**{label} — WAIT**\n\n{m['confidence']:.0f}%\n\n{m['reason']}")
+
+                if result["final"] in {"LONG", "SHORT"}:
+                    st.success(f"👨‍⚖️ Final Judge: {result['final']} — {result['portfolio']['confidence']:.0f}/100 | Timing: {result['entry_status']}")
+                    try:
+                        signal_id = save_signal(result)
+                        st.caption(f"💾 Paper trade otomatis tersimpan. ID {signal_id}")
+                    except Exception as save_err:
+                        st.warning(f"Paper trade terdeteksi tetapi gagal disimpan: {save_err}")
+                    if tg_on and not already_notified:
+                        ok, msg = telegram(telegram_message(result))
+                        if ok:
+                            mark_pattern_notified(event_id)
+                            st.success("📱 Telegram: signal paper-trade terkirim.")
+                        else:
+                            st.warning(f"Telegram belum terkirim: {msg}")
+                else:
+                    st.warning(f"AI memvalidasi setup tetapi belum memberi entry: {result['portfolio']['confidence']:.0f}/100")
+            except Exception as e:
+                st.error(f"AI validation gagal untuk {snap['symbol']}: {e}")
+        elif p["state"] == "TRIGGERED":
+            st.warning("Setup terpicu, tetapi Groq belum tersedia. Radar tidak membuka trade otomatis.")
+        else:
+            st.info("Setup berkembang. AI belum dipanggil untuk menghemat token; tunggu trigger lebih kuat.")
+
+if monitor_auto:
+    # Streamlit >=1.37 supports fragment auto-rerun. If unavailable, the user can
+    # still use the manual button below; no extra package is required.
+    if hasattr(st, "fragment"):
+        @st.fragment(run_every=f"{monitor_interval}s")
+        def _auto_v56_fragment():
+            _run_v56_monitor()
+        _auto_v56_fragment()
+    else:
+        st.info("Auto monitor memerlukan Streamlit versi yang mendukung fragment. Gunakan tombol SCAN MOMENTUM di bawah.")
+
+if st.button("🚨 SCAN MOMENTUM SEKARANG", use_container_width=True, key="v56_manual_scan"):
+    _run_v56_monitor()
 
 st.divider()
 
@@ -2143,6 +2494,24 @@ else:
                 name="EMA200",
             )
         )
+
+        # V5.6: draw individual Order Blocks and FVGs, not only the combined entry zone.
+        # These are analytical zones, not guaranteed support/resistance.
+        smc_chart = result["packet"]["smc"]
+        for idx, z in enumerate(smc_chart.get("order_blocks", [])[:6]):
+            fig.add_hrect(
+                y0=z["low"], y1=z["high"],
+                line_width=1, opacity=0.10,
+                annotation_text=f"OB {z['direction']}",
+                annotation_position="left",
+            )
+        for idx, z in enumerate(smc_chart.get("fvgs", [])[:6]):
+            fig.add_hrect(
+                y0=z["low"], y1=z["high"],
+                line_width=1, opacity=0.06,
+                annotation_text=f"FVG {z['direction']}",
+                annotation_position="right",
+            )
 
         # V5.5 visual timing zones. These are guidance zones, not guaranteed support/resistance.
         bull_zone = result["packet"]["smc"]["bullish_entry"]
@@ -2334,6 +2703,17 @@ else:
             "Risiko final: "
             + result["portfolio"]["key_risk"]
         )
+
+        st.markdown("### 🎯 Tiga Trading Mode")
+        mode_cols = st.columns(3)
+        for col, (mode_key, mode_label) in zip(
+            mode_cols, (("scalping", "⚡ Scalping"), ("intraday", "📊 Intraday"), ("swing", "🌊 Swing"))
+        ):
+            m = result.get("modes", {}).get(mode_key, {"decision":"WAIT", "confidence":0, "reason":"Tidak tersedia"})
+            text = f"**{mode_label} — {m['decision']}**\n\nConfidence: {m['confidence']:.0f}\n\n{m['reason']}"
+            if m["decision"] == "LONG": col.success(text)
+            elif m["decision"] == "SHORT": col.error(text)
+            else: col.warning(text)
 
         if final in {"LONG", "SHORT"}:
             e1, e2, e3, e4 = st.columns(4)
