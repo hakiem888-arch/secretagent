@@ -928,10 +928,11 @@ AI_SCHEMA = {
                     "additionalProperties": False,
                 },
             },
+            "required": ["scalping", "intraday", "swing"],
             "additionalProperties": False,
         },
     },
-    "required": ["decision", "confidence", "reasoning", "key_risk", "evidence"],
+    "required": ["decision", "confidence", "reasoning", "key_risk", "evidence", "modes"],
     "additionalProperties": False,
 }
 
