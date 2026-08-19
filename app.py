@@ -422,7 +422,9 @@ def _detect_liquidity(df):
     }
 
 def _detect_fvgs(df, max_age=80):
-    d = _closed_df(df).tail(max_age + 5).reset_index(drop=False)
+    d = _closed_df(df).tail(max_age + 5).copy()
+    d["timestamp"] = d.index.astype(str)
+    d = d.reset_index(drop=True)
     zones = []
     for i in range(2, len(d)):
         c1 = d.iloc[i-2]
@@ -433,7 +435,7 @@ def _detect_fvgs(df, max_age=80):
                 "direction": "BULLISH",
                 "low": float(c1.High),
                 "high": float(c3.Low),
-                "created_at": str(c3["index"]),
+                "created_at": str(c3["timestamp"]),
                 "age": len(d) - 1 - i,
             })
         elif float(c3.High) < float(c1.Low):
@@ -441,7 +443,7 @@ def _detect_fvgs(df, max_age=80):
                 "direction": "BEARISH",
                 "low": float(c3.High),
                 "high": float(c1.Low),
-                "created_at": str(c3["index"]),
+                "created_at": str(c3["timestamp"]),
                 "age": len(d) - 1 - i,
             })
 
@@ -459,7 +461,9 @@ def _detect_fvgs(df, max_age=80):
     return out
 
 def _detect_order_blocks(df, max_age=80):
-    d = _closed_df(df).tail(max_age + 10).reset_index(drop=False)
+    d = _closed_df(df).tail(max_age + 10).copy()
+    d["timestamp"] = d.index.astype(str)
+    d = d.reset_index(drop=True)
     zones = []
     for i in range(2, len(d)):
         c = d.iloc[i]
@@ -483,7 +487,7 @@ def _detect_order_blocks(df, max_age=80):
                     "direction": "BULLISH",
                     "low": float(prev.Low),
                     "high": float(prev.Open),
-                    "created_at": str(c["index"]),
+                    "created_at": str(c["timestamp"]),
                     "age": len(d) - 1 - i,
                     "displacement": True,
                     "volume_ratio": vol_ratio,
@@ -494,7 +498,7 @@ def _detect_order_blocks(df, max_age=80):
                     "direction": "BEARISH",
                     "low": float(prev.Open),
                     "high": float(prev.High),
-                    "created_at": str(c["index"]),
+                    "created_at": str(c["timestamp"]),
                     "age": len(d) - 1 - i,
                     "displacement": True,
                     "volume_ratio": vol_ratio,
