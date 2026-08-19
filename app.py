@@ -129,6 +129,17 @@ def init_db():
     );
     """)
     con.commit()
+    existing_cols = {row[1] for row in con.execute("PRAGMA table_info(signals)").fetchall()}
+    for col, ddl in [
+        ("smc_score", "ALTER TABLE signals ADD COLUMN smc_score REAL"),
+        ("entry_status", "ALTER TABLE signals ADD COLUMN entry_status TEXT"),
+        ("entry_zone_low", "ALTER TABLE signals ADD COLUMN entry_zone_low REAL"),
+        ("entry_zone_high", "ALTER TABLE signals ADD COLUMN entry_zone_high REAL"),
+        ("smc_bias", "ALTER TABLE signals ADD COLUMN smc_bias TEXT"),
+    ]:
+        if col not in existing_cols:
+            con.execute(ddl)
+    con.commit()
     con.close()
 
 init_db()
@@ -297,6 +308,364 @@ def candle_info(d):
         "lower_wick": lower / rng,
     }
 
+
+# -------------------------
+# Smart Money / Price Structure Engine V5.5
+# -------------------------
+def _closed_df(df):
+    """Use the last fully closed candle for structure calculations."""
+    if len(df) > 8:
+        return df.iloc[:-1].copy()
+    return df.copy()
+
+def _pct_distance(a, b):
+    return abs(a - b) / max(abs(b), 1e-12) * 100.0
+
+def _find_pivots(df, left=2, right=2, lookback=100):
+    d = _closed_df(df).tail(lookback).reset_index(drop=False)
+    highs = []
+    lows = []
+    for i in range(left, len(d) - right):
+        h = float(d.loc[i, "High"])
+        l = float(d.loc[i, "Low"])
+        if h >= float(d.loc[i-left:i+right, "High"].max()):
+            highs.append({"i": i, "price": h, "time": str(d.loc[i, "index"])})
+        if l <= float(d.loc[i-left:i+right, "Low"].min()):
+            lows.append({"i": i, "price": l, "time": str(d.loc[i, "index"])})
+    return highs, lows
+
+def _detect_structure(df):
+    d = _closed_df(df)
+    highs, lows = _find_pivots(d, 2, 2, 120)
+    close = float(d.Close.iloc[-1])
+    last_high = highs[-1]["price"] if highs else float(d.High.tail(20).max())
+    prev_high = highs[-2]["price"] if len(highs) >= 2 else last_high
+    last_low = lows[-1]["price"] if lows else float(d.Low.tail(20).min())
+    prev_low = lows[-2]["price"] if len(lows) >= 2 else last_low
+
+    if last_high > prev_high and last_low > prev_low:
+        bias = "BULLISH"
+    elif last_high < prev_high and last_low < prev_low:
+        bias = "BEARISH"
+    else:
+        bias = "RANGE"
+
+    bos = "NONE"
+    if close > last_high:
+        bos = "BULLISH BOS"
+    elif close < last_low:
+        bos = "BEARISH BOS"
+
+    prior_bias = "RANGE"
+    if len(highs) >= 3 and len(lows) >= 3:
+        hh = highs[-2]["price"] > highs[-3]["price"]
+        hl = lows[-2]["price"] > lows[-3]["price"]
+        lh = highs[-2]["price"] < highs[-3]["price"]
+        ll = lows[-2]["price"] < lows[-3]["price"]
+        if hh and hl:
+            prior_bias = "BULLISH"
+        elif lh and ll:
+            prior_bias = "BEARISH"
+
+    choch = "NONE"
+    if bos == "BULLISH BOS" and prior_bias == "BEARISH":
+        choch = "BULLISH CHOCH"
+    elif bos == "BEARISH BOS" and prior_bias == "BULLISH":
+        choch = "BEARISH CHOCH"
+
+    return {
+        "bias": bias,
+        "bos": bos,
+        "choch": choch,
+        "last_swing_high": last_high,
+        "last_swing_low": last_low,
+        "previous_swing_high": prev_high,
+        "previous_swing_low": prev_low,
+    }
+
+def _detect_liquidity(df):
+    d = _closed_df(df)
+    if len(d) < 25:
+        return {"sweep_high": False, "sweep_low": False, "equal_high": None, "equal_low": None}
+
+    c = d.iloc[-1]
+    look = d.iloc[-21:-1]
+    prev_high = float(look.High.max())
+    prev_low = float(look.Low.min())
+
+    sweep_high = float(c.High) > prev_high and float(c.Close) < prev_high
+    sweep_low = float(c.Low) < prev_low and float(c.Close) > prev_low
+
+    # Equal highs/lows are useful liquidity pools; use a tight 0.15% tolerance.
+    eq_high = None
+    eq_low = None
+    recent_highs = sorted([float(x) for x in look.High.tail(15)], reverse=True)
+    recent_lows = sorted([float(x) for x in look.Low.tail(15)])
+    if len(recent_highs) >= 2 and _pct_distance(recent_highs[0], recent_highs[1]) <= 0.15:
+        eq_high = sum(recent_highs[:2]) / 2
+    if len(recent_lows) >= 2 and _pct_distance(recent_lows[0], recent_lows[1]) <= 0.15:
+        eq_low = sum(recent_lows[:2]) / 2
+
+    return {
+        "sweep_high": bool(sweep_high),
+        "sweep_low": bool(sweep_low),
+        "equal_high": eq_high,
+        "equal_low": eq_low,
+        "recent_high": prev_high,
+        "recent_low": prev_low,
+    }
+
+def _detect_fvgs(df, max_age=80):
+    d = _closed_df(df).tail(max_age + 5).reset_index(drop=False)
+    zones = []
+    for i in range(2, len(d)):
+        c1 = d.iloc[i-2]
+        c3 = d.iloc[i]
+        # Three-candle imbalance.
+        if float(c3.Low) > float(c1.High):
+            zones.append({
+                "direction": "BULLISH",
+                "low": float(c1.High),
+                "high": float(c3.Low),
+                "created_at": str(c3["index"]),
+                "age": len(d) - 1 - i,
+            })
+        elif float(c3.High) < float(c1.Low):
+            zones.append({
+                "direction": "BEARISH",
+                "low": float(c3.High),
+                "high": float(c1.Low),
+                "created_at": str(c3["index"]),
+                "age": len(d) - 1 - i,
+            })
+
+    # Keep the most recent zones, with a simple mitigation flag.
+    price = float(d.Close.iloc[-1])
+    out = []
+    for z in reversed(zones[-12:]):
+        z = dict(z)
+        if z["direction"] == "BULLISH":
+            z["filled"] = price <= z["low"]
+        else:
+            z["filled"] = price >= z["high"]
+        z["size_pct"] = _pct_distance(z["high"], z["low"])
+        out.append(z)
+    return out
+
+def _detect_order_blocks(df, max_age=80):
+    d = _closed_df(df).tail(max_age + 10).reset_index(drop=False)
+    zones = []
+    for i in range(2, len(d)):
+        c = d.iloc[i]
+        atr_value = float(c.ATR) if pd.notna(c.ATR) else 0.0
+        rng = max(float(c.High) - float(c.Low), 1e-12)
+        body = abs(float(c.Close) - float(c.Open))
+        body_ratio = body / rng
+        vol_ratio = float(c.VOL_RATIO) if pd.notna(c.VOL_RATIO) else 0.0
+
+        # Look for a displacement candle and use the last opposite candle as the OB.
+        if atr_value <= 0:
+            continue
+        displacement = body >= 1.15 * atr_value and body_ratio >= 0.55 and vol_ratio >= 1.15
+        if not displacement:
+            continue
+
+        for j in range(max(0, i-3), i):
+            prev = d.iloc[j]
+            if float(c.Close) > float(c.Open) and float(prev.Close) < float(prev.Open):
+                zones.append({
+                    "direction": "BULLISH",
+                    "low": float(prev.Low),
+                    "high": float(prev.Open),
+                    "created_at": str(c["index"]),
+                    "age": len(d) - 1 - i,
+                    "displacement": True,
+                    "volume_ratio": vol_ratio,
+                })
+                break
+            if float(c.Close) < float(c.Open) and float(prev.Close) > float(prev.Open):
+                zones.append({
+                    "direction": "BEARISH",
+                    "low": float(prev.Open),
+                    "high": float(prev.High),
+                    "created_at": str(c["index"]),
+                    "age": len(d) - 1 - i,
+                    "displacement": True,
+                    "volume_ratio": vol_ratio,
+                })
+                break
+
+    return list(reversed(zones[-12:]))
+
+def _zone_quality(zone, fvg=None, structure=None, liquidity=None):
+    score = 45.0
+    if zone.get("displacement"):
+        score += 20
+    if zone.get("volume_ratio", 0) >= 1.5:
+        score += 10
+    if fvg is not None:
+        score += 15
+    if structure:
+        if zone["direction"] == "BULLISH" and structure["bias"] == "BULLISH":
+            score += 10
+        elif zone["direction"] == "BEARISH" and structure["bias"] == "BEARISH":
+            score += 10
+    if liquidity:
+        if zone["direction"] == "BULLISH" and liquidity.get("sweep_low"):
+            score += 10
+        if zone["direction"] == "BEARISH" and liquidity.get("sweep_high"):
+            score += 10
+    return int(max(0, min(100, score)))
+
+def _build_entry_context(df, structure, liquidity, obs, fvgs):
+    d = _closed_df(df)
+    price = float(d.Close.iloc[-1])
+    atr_value = float(d.ATR.iloc[-1]) if pd.notna(d.ATR.iloc[-1]) else 0.0
+
+    bull_obs = [x for x in obs if x["direction"] == "BULLISH"]
+    bear_obs = [x for x in obs if x["direction"] == "BEARISH"]
+    bull_fvgs = [x for x in fvgs if x["direction"] == "BULLISH" and not x["filled"]]
+    bear_fvgs = [x for x in fvgs if x["direction"] == "BEARISH" and not x["filled"]]
+
+    def candidate(direction, obs_list, fvg_list):
+        ob = obs_list[0] if obs_list else None
+        fvg = fvg_list[0] if fvg_list else None
+        zone = None
+        confluence = False
+        if ob and fvg:
+            lo = max(ob["low"], fvg["low"])
+            hi = min(ob["high"], fvg["high"])
+            if lo <= hi:
+                zone = (lo, hi)
+                confluence = True
+        if zone is None and ob:
+            zone = (ob["low"], ob["high"])
+        if zone is None and fvg:
+            zone = (fvg["low"], fvg["high"])
+
+        if zone is None:
+            return {
+                "direction": direction, "zone_low": None, "zone_high": None,
+                "quality": 0, "confluence": False, "status": "NO_ZONE",
+                "distance_pct": None,
+            }
+
+        lo, hi = min(zone), max(zone)
+        quality = _zone_quality(ob or {"direction": direction}, fvg, structure, liquidity)
+        if confluence:
+            quality = min(100, quality + 10)
+
+        # Distance and timing: the AI may be right on direction but still late.
+        if lo <= price <= hi:
+            status = "IN_ZONE"
+        elif direction == "BULLISH" and price > hi:
+            late_limit = max(atr_value * 0.75, price * 0.002)
+            status = "LATE" if price - hi > late_limit else "WAIT_RETEST"
+        elif direction == "BEARISH" and price < lo:
+            late_limit = max(atr_value * 0.75, price * 0.002)
+            status = "LATE" if lo - price > late_limit else "WAIT_RETEST"
+        else:
+            status = "WAIT_RETEST"
+
+        distance_pct = (
+            _pct_distance(price, (lo + hi) / 2) if zone else None
+        )
+
+        return {
+            "direction": direction,
+            "zone_low": lo,
+            "zone_high": hi,
+            "quality": quality,
+            "confluence": confluence,
+            "status": status,
+            "distance_pct": distance_pct,
+        }
+
+    bull = candidate("BULLISH", bull_obs, bull_fvgs)
+    bear = candidate("BEARISH", bear_obs, bear_fvgs)
+
+    # Trigger = zone + evidence of reaction. We keep it conservative.
+    last = d.iloc[-1]
+    body = abs(float(last.Close) - float(last.Open))
+    rng = max(float(last.High) - float(last.Low), 1e-12)
+    body_ratio = body / rng
+    vol_ratio = float(last.VOL_RATIO) if pd.notna(last.VOL_RATIO) else 0.0
+    bullish_trigger = (
+        bull["status"] == "IN_ZONE"
+        and (
+            liquidity.get("sweep_low")
+            or (float(last.Close) > float(last.Open) and body_ratio >= 0.45)
+        )
+        and vol_ratio >= 1.05
+    )
+    bearish_trigger = (
+        bear["status"] == "IN_ZONE"
+        and (
+            liquidity.get("sweep_high")
+            or (float(last.Close) < float(last.Open) and body_ratio >= 0.45)
+        )
+        and vol_ratio >= 1.05
+    )
+
+    if bullish_trigger:
+        timing = "READY_LONG"
+    elif bearish_trigger:
+        timing = "READY_SHORT"
+    elif bull["status"] == "LATE" or bear["status"] == "LATE":
+        timing = "LATE"
+    else:
+        timing = "WAIT_RETEST"
+
+    # Overall SMC score is not a trade signal; it ranks setup quality.
+    quality_candidates = [bull["quality"], bear["quality"]]
+    smc_score = max(quality_candidates) if quality_candidates else 0
+
+    return {
+        "structure": structure,
+        "liquidity": liquidity,
+        "order_blocks": obs[-8:],
+        "fvgs": fvgs[-8:],
+        "bullish_entry": bull,
+        "bearish_entry": bear,
+        "bullish_trigger": bullish_trigger,
+        "bearish_trigger": bearish_trigger,
+        "timing": timing,
+        "smc_score": smc_score,
+        "displacement": {
+            "body_ratio": body_ratio,
+            "volume_ratio": vol_ratio,
+            "bullish": float(last.Close) > float(last.Open) and body_ratio >= 0.55 and vol_ratio >= 1.15,
+            "bearish": float(last.Close) < float(last.Open) and body_ratio >= 0.55 and vol_ratio >= 1.15,
+        },
+    }
+
+def smc_analysis(df):
+    structure = _detect_structure(df)
+    liquidity = _detect_liquidity(df)
+    fvgs = _detect_fvgs(df)
+    obs = _detect_order_blocks(df)
+    return _build_entry_context(df, structure, liquidity, obs, fvgs)
+
+def smc_text(smc):
+    stc = smc["structure"]
+    liq = smc["liquidity"]
+    b = smc["bullish_entry"]
+    s = smc["bearish_entry"]
+    return "\n".join([
+        f"STRUCTURE bias={stc['bias']} BOS={stc['bos']} CHOCH={stc['choch']}",
+        f"SWING high={stc['last_swing_high']:.8f} low={stc['last_swing_low']:.8f}",
+        f"LIQUIDITY sweep_high={liq['sweep_high']} sweep_low={liq['sweep_low']} "
+        f"equal_high={liq['equal_high']} equal_low={liq['equal_low']}",
+        f"BULL ENTRY zone={b['zone_low']}..{b['zone_high']} quality={b['quality']} "
+        f"confluence={b['confluence']} status={b['status']}",
+        f"BEAR ENTRY zone={s['zone_low']}..{s['zone_high']} quality={s['quality']} "
+        f"confluence={s['confluence']} status={s['status']}",
+        f"TIMING={smc['timing']} SMC_SCORE={smc['smc_score']}",
+        f"DISPLACEMENT body_ratio={smc['displacement']['body_ratio']:.2f} "
+        f"vol_ratio={smc['displacement']['volume_ratio']:.2f}",
+    ])
+
+
 def market_regime(d):
     a = d.iloc[-1]
     vol = float(a.ATR / a.Close)
@@ -438,10 +807,10 @@ def scan_markets(n=60):
     )
 
 # -------------------------
-# AI engine — V5.5 Hierarchical Multi-Model Safe Mode
+# AI engine — V5.3.1 Hierarchical Multi-Model Safe Mode
 # Fix: pass tier into _request_groq; model-specific reasoning for Qwen/GPT-OSS.
 # -------------------------
-# V5.5 design goals:
+# V5.3 design goals:
 # - Use strict Structured Outputs for GPT-OSS where supported.
 # - Use JSON Object Mode + local validation for other models.
 # - Groq keys rotate legitimately when a key is rate-limited/quota/auth-failed.
@@ -570,7 +939,7 @@ def _is_model_not_found(message):
 
 def _build_prompt(role, data, instructions):
     # IMPORTANT: the literal word JSON is intentionally present. This is
-    # harmless because V5.5 uses model-aware response_format, but it
+    # harmless because V5.3 uses model-aware response_format, but it
     # also makes the prompt compatible if a provider enforces JSON wording.
     return f"""
 Kamu adalah {role} dalam sistem riset trading multi-agent.
@@ -682,7 +1051,7 @@ def _request_groq(model, prompt, key, max_tokens, tier):
         "max_completion_tokens": max(384, int(max_tokens)),
     }
 
-    # GPT-OSS: strict schema is useful, but keep reasoning LOW in V5.5 so
+    # GPT-OSS: strict schema is useful, but keep reasoning LOW in V5.4 so
     # the model has enough completion budget left to actually emit the JSON.
     if model in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}:
         kwargs["reasoning_effort"] = MODEL_TIERS[tier].get("reasoning_effort", "low")
@@ -739,7 +1108,7 @@ def call_ai(role, data, instructions, tier="analyst", budget=None):
     prompt = _build_prompt(role, data, instructions)
     errors = []
 
-    # V5.5 intentionally uses Groq only. DeepSeek was removed because the
+    # V5.4 intentionally uses Groq only. DeepSeek was removed because the
     # configured account returned HTTP 402 (Insufficient Balance).
     providers = ["groq"] if GROQ_KEYS else []
 
@@ -824,23 +1193,17 @@ def call_ai(role, data, instructions, tier="analyst", budget=None):
 # -------------------------
 def market_packet(symbol):
     frames = {}
-
-    for tf, limit in [
-        ("5m", 160),
-        ("15m", 180),
-        ("1h", 180),
-    ]:
+    for tf, limit in [("5m", 160), ("15m", 180), ("1h", 180)]:
         frames[tf] = klines(symbol, tf, limit)
 
     ob = order_book(symbol)
     d = frames["15m"]
-
     c = candle_info(d)
     a = d.iloc[-1]
-
     support = float(d.Low.tail(30).min())
     resistance = float(d.High.tail(30).max())
 
+    smc_by_tf = {tf: smc_analysis(df) for tf, df in frames.items()}
     packet = {
         "symbol": symbol,
         "price": float(a.Close),
@@ -850,11 +1213,11 @@ def market_packet(symbol):
         "resistance": resistance,
         "candlestick": c,
         "timeframes": {},
+        "smc": smc_by_tf["15m"],
+        "smc_by_tf": smc_by_tf,
     }
-
     for tf, df in frames.items():
         x = df.iloc[-1]
-
         packet["timeframes"][tf] = {
             "price": float(x.Close),
             "ema20": float(x.EMA20),
@@ -868,7 +1231,6 @@ def market_packet(symbol):
             "bb_upper": float(x.BB_UP),
             "bb_lower": float(x.BB_LOW),
         }
-
     return frames, packet
 
 def packet_text(packet):
@@ -885,8 +1247,10 @@ def packet_text(packet):
         f"Upper wick: {packet['candlestick']['upper_wick']:.1%}",
         f"Lower wick: {packet['candlestick']['lower_wick']:.1%}",
         "",
+        "=== SMART MONEY / PRICE STRUCTURE ===",
+        smc_text(packet["smc"]),
+        "",
     ]
-
     for tf, x in packet["timeframes"].items():
         lines.extend([
             f"[TIMEFRAME {tf}]",
@@ -901,17 +1265,15 @@ def packet_text(packet):
             f"BB_UP={x['bb_upper']:.8f}",
             f"BB_LOW={x['bb_lower']:.8f}",
             "",
+            f"[SMC {tf}]",
+            smc_text(packet["smc_by_tf"][tf]),
+            "",
         ])
-
     return "\n".join(lines)
 
-
 def specialist_data(packet, focus):
-    """Give each specialist only the market fields it is responsible for.
-    This is a major token-saving change: analysts no longer receive an
-    identical full market dump.
-    """
     tf = packet["timeframes"]
+    smc = packet["smc"]
     lines = [
         f"Symbol: {packet['symbol']}",
         f"Harga: {packet['price']:.8f}",
@@ -919,38 +1281,45 @@ def specialist_data(packet, focus):
         f"Support: {packet['support']:.8f}",
         f"Resistance: {packet['resistance']:.8f}",
     ]
-    if focus == "technical":
+    if focus == "structure":
         for name in ("5m", "15m", "1h"):
-            x = tf[name]
+            stc = packet["smc_by_tf"][name]["structure"]
             lines += [
-                f"[{name}] EMA20={x['ema20']:.8f} EMA50={x['ema50']:.8f} EMA200={x['ema200']:.8f}",
-                f"[{name}] MACD_HIST={x['macd_hist']:.8f} RSI={x['rsi']:.2f}",
+                f"[{name}] bias={stc['bias']} BOS={stc['bos']} CHOCH={stc['choch']}",
+                f"[{name}] swing_high={stc['last_swing_high']:.8f} swing_low={stc['last_swing_low']:.8f}",
             ]
-    elif focus == "momentum":
+    elif focus == "liquidity":
+        for name in ("5m", "15m", "1h"):
+            liq = packet["smc_by_tf"][name]["liquidity"]
+            lines += [
+                f"[{name}] sweep_high={liq['sweep_high']} sweep_low={liq['sweep_low']}",
+                f"[{name}] equal_high={liq['equal_high']} equal_low={liq['equal_low']}",
+            ]
+    elif focus == "smc":
+        lines.append("=== ORDER BLOCK / FVG ===")
+        lines.append(smc_text(smc))
+        for z in smc["order_blocks"][:4]:
+            lines.append(
+                f"OB {z['direction']} {z['low']:.8f}..{z['high']:.8f} age={z['age']} vol={z['volume_ratio']:.2f}"
+            )
+        for z in smc["fvgs"][:4]:
+            lines.append(
+                f"FVG {z['direction']} {z['low']:.8f}..{z['high']:.8f} age={z['age']} filled={z['filled']}"
+            )
+    else:
+        ob = packet["order_book"]
         for name in ("5m", "15m", "1h"):
             x = tf[name]
             lines += [
                 f"[{name}] RSI={x['rsi']:.2f} VOL_RATIO={x['vol_ratio']:.2f}x BUY_PRESSURE={x['buy_pressure']:.1%}",
-                f"[{name}] MACD_HIST={x['macd_hist']:.8f}",
+                f"[{name}] MACD_HIST={x['macd_hist']:.8f} EMA20={x['ema20']:.8f} EMA50={x['ema50']:.8f}",
             ]
-    elif focus == "orderflow":
-        ob = packet["order_book"]
-        x = tf["15m"]
         lines += [
             f"Order imbalance={ob['imbalance']:+.2%}",
-            f"Spread={ob['spread']:.3f}% BidDepth={ob['bid_depth']:.4f} AskDepth={ob['ask_depth']:.4f}",
-            f"15m BUY_PRESSURE={x['buy_pressure']:.1%} VOL_RATIO={x['vol_ratio']:.2f}x",
-        ]
-    else:  # price action
-        c = packet["candlestick"]
-        x = tf["15m"]
-        lines += [
-            f"Candle={c['name']} Body={c['body']:.1%} UpperWick={c['upper_wick']:.1%} LowerWick={c['lower_wick']:.1%}",
-            f"15m RSI={x['rsi']:.2f} EMA20={x['ema20']:.8f} EMA50={x['ema50']:.8f}",
-            f"15m VOL_RATIO={x['vol_ratio']:.2f}x MACD_HIST={x['macd_hist']:.8f}",
+            f"Spread={ob['spread']:.3f}%",
+            f"15m entry timing={smc['timing']} SMC score={smc['smc_score']}",
         ]
     return "\n".join(lines)
-
 
 def memory_context(symbol, limit=5):
     """Small historical context. Memory is now actually consumed by Research,
@@ -979,13 +1348,13 @@ def memory_context(symbol, limit=5):
     )
 
 # -------------------------
-# V5.5 Hierarchical orchestration
+# V5.3 Hierarchical orchestration
 # -------------------------
 ANALYSTS = [
-    ("🧭 Technical Analyst", "Fokus trend multi-timeframe, EMA, MACD, support/resistance, dan regime."),
-    ("⚡ Momentum Analyst", "Fokus RSI, volume ratio, taker-buy pressure, momentum, dan konfirmasi timeframe."),
-    ("📚 Order Flow Analyst", "Fokus order-book imbalance, spread, liquidity, dan tekanan beli/jual."),
-    ("🕯️ Price Action Analyst", "Fokus candle, wick, rejection, breakout, struktur harga, support/resistance."),
+    ("🏗️ Structure Analyst", "Fokus market structure multi-timeframe: HH/HL/LH/LL, BOS, CHOCH, swing highs/lows, trend vs range."),
+    ("💧 Liquidity Analyst", "Fokus liquidity pool, equal high/low, liquidity sweep, stop-run, false breakout, dan lokasi likuiditas."),
+    ("🧱 Order Block & FVG Analyst", "Fokus Order Block, Fair Value Gap, displacement, freshness, confluence, kualitas zona, dan lokasi entry."),
+    ("⚡ Execution Analyst", "Fokus volume, taker-buy pressure, order-book imbalance, ATR, RSI, EMA/MACD sebagai konfirmasi timing."),
 ]
 
 
@@ -1024,10 +1393,10 @@ def run_multi_agent(symbol, scanner_score_value):
     # 1) Four analyst ringan. Mereka tidak melihat output agent lain dan tidak menjadi hakim.
     analyst_results = []
     focus_map = {
-        "🧭 Technical Analyst": "technical",
-        "⚡ Momentum Analyst": "momentum",
-        "📚 Order Flow Analyst": "orderflow",
-        "🕯️ Price Action Analyst": "priceaction",
+        "🏗️ Structure Analyst": "structure",
+        "💧 Liquidity Analyst": "liquidity",
+        "🧱 Order Block & FVG Analyst": "smc",
+        "⚡ Execution Analyst": "execution",
     }
     for name, rule in ANALYSTS:
         analyst_results.append({
@@ -1049,14 +1418,14 @@ def run_multi_agent(symbol, scanner_score_value):
     bull = call_ai(
         "🐂 Bull Researcher",
         debate_data,
-        "Bangun kasus LONG paling kuat. Tunjukkan bukti utama, kondisi yang membatalkan thesis, dan risiko terbesar. Jangan menjadi final judge.",
+        "Bangun kasus LONG paling kuat dengan urutan structure → liquidity → OB/FVG → displacement → execution. Bedakan arah yang benar dari entry yang sudah terlambat. Sebutkan entry zone dan kondisi trigger jika tersedia. Jangan menjadi final judge.",
         tier="debate",
     )
     bear_data = debate_data + "\n\nTHESIS BULL YANG HARUS DISERANG:\n" + compact_json(bull, 1100)
     bear = call_ai(
         "🐻 Bear Researcher",
         bear_data,
-        "Serang thesis Bull secara spesifik. Cari bukti yang bertentangan, resistance, overextension, flow berlawanan, false breakout, konflik timeframe, dan alasan WAIT/SHORT. Jangan sekadar berbeda pendapat tanpa bukti.",
+        "Serang thesis Bull secara spesifik. Cari liquidity sweep yang gagal, OB/FVG yang lemah atau sudah termitigasi, BOS/CHOCH yang bertentangan, overextension, displacement palsu, konflik timeframe, dan terutama apakah harga sudah LATE untuk entry. Jangan sekadar berbeda pendapat tanpa bukti.",
         tier="debate",
     )
     debate = debate_summary_text(bull, bear)
@@ -1071,7 +1440,7 @@ def run_multi_agent(symbol, scanner_score_value):
     research_manager = call_ai(
         "🧠 Research Manager",
         research_input,
-        "Sintesis bukti terbaik. Nilai konflik timeframe, kualitas Bull vs Bear, dan tetapkan thesis riset serta kondisi yang wajib terpenuhi sebelum entry.",
+        "Sintesis bukti terbaik. Nilai structure, liquidity, OB/FVG, displacement, konflik timeframe, kualitas Bull vs Bear, dan bedakan SIGNAL dari ENTRY. Tetapkan kondisi yang wajib terpenuhi sebelum entry dan tolak setup jika timing sudah terlambat.",
         tier="research",
     )
 
@@ -1079,13 +1448,14 @@ def run_multi_agent(symbol, scanner_score_value):
     trader_input = (
         f"Market: {packet['symbol']} price={packet['price']:.8f}, ATR15={packet['timeframes']['15m']['atr']:.8f}, "
         f"support={packet['support']:.8f}, resistance={packet['resistance']:.8f}, regime={packet['market_regime']}\n"
+        f"SMC: {smc_text(packet['smc'])}\n"
         f"Research: {compact_json(research_manager)}\n"
         f"Bull/Bear: {debate}"
     )
     trader = call_ai(
         "💹 Trader",
         trader_input,
-        "Ubah thesis menjadi rencana paper-trade LONG/SHORT/WAIT. Fokus entry condition, invalidation, dan apakah setup layak secara risk/reward. Jangan menjadi final judge.",
+        "Ubah thesis menjadi rencana paper-trade LONG/SHORT/WAIT. Fokus SIGNAL vs ENTRY, entry zone OB/FVG, retest, trigger displacement/liquidity, invalidation, dan apakah harga sudah terlambat. Jika belum berada di zona/trigger, pilih WAIT. Jangan menjadi final judge.",
         tier="analyst",
         budget=240,
     )
@@ -1100,6 +1470,7 @@ def run_multi_agent(symbol, scanner_score_value):
         f"Symbol={symbol}; price={packet['price']:.8f}; regime={packet['market_regime']}; "
         f"spread={packet['order_book']['spread']:.3f}%; imbalance={packet['order_book']['imbalance']:+.2%}; "
         f"support={packet['support']:.8f}; resistance={packet['resistance']:.8f}; "
+        f"SMC={smc_text(packet['smc'])}; "
         f"Research={compact_json(research_manager)}; Trader={compact_json(trader)}"
     )
     risk_agents = []
@@ -1121,6 +1492,7 @@ def run_multi_agent(symbol, scanner_score_value):
         f"MARKET: {symbol} price={packet['price']:.8f} regime={packet['market_regime']} "
         f"support={packet['support']:.8f} resistance={packet['resistance']:.8f} "
         f"spread={packet['order_book']['spread']:.3f}% imbalance={packet['order_book']['imbalance']:+.2%}\n"
+        f"SMC / ENTRY TIMING:\n{smc_text(packet['smc'])}\n"
         f"ANALYSTS:\n{analyst_summary}\n"
         f"BULL/BEAR:\n{debate}\n"
         f"RESEARCH:\n{compact_json(research_manager)}\n"
@@ -1131,11 +1503,21 @@ def run_multi_agent(symbol, scanner_score_value):
     portfolio = call_ai(
         "👨‍⚖️ Final Judge",
         judge_input,
-        "Ambil keputusan final LONG/SHORT/WAIT. Jangan voting mayoritas secara buta. Prioritaskan kualitas bukti, konflik timeframe, Bull vs Bear, research, trader plan, risk team, spread, regime, dan jarak support/resistance. Jika konflik berat atau risk/reward buruk, WAIT.",
+        "Ambil keputusan final LONG/SHORT/WAIT. Jangan voting mayoritas secara buta. Prioritaskan structure, liquidity, OB/FVG quality, displacement, entry zone, entry timing, konflik timeframe, Bull vs Bear, research, trader plan, risk team, spread, regime, dan risk/reward. SIGNAL boleh benar tetapi ENTRY harus tetap WAIT jika belum retest/trigger atau sudah LATE.",
         tier="judge",
     )
 
     final = portfolio["decision"]
+
+    # Timing gate: arah boleh benar, tetapi jangan entry sebelum retest/trigger
+    # dan jangan mengejar harga yang sudah terlalu jauh dari zona.
+    timing = packet["smc"]["timing"]
+    if timing in {"LATE", "WAIT_RETEST"} and final in {"LONG", "SHORT"}:
+        final = "WAIT"
+    elif timing == "READY_LONG" and final == "SHORT":
+        final = "WAIT"
+    elif timing == "READY_SHORT" and final == "LONG":
+        final = "WAIT"
 
     # Hard safety gate tetap dilakukan Python, bukan dipercayakan ke LLM.
     analyst_direction = sum(
@@ -1164,11 +1546,17 @@ def run_multi_agent(symbol, scanner_score_value):
     current = packet["price"]
     atr15 = packet["timeframes"]["15m"]["atr"]
     if final == "LONG":
-        sl = current - 1.0 * atr15
-        tp = current + 2.0 * atr15
+        zone = packet["smc"]["bullish_entry"]
+        sl_anchor = zone["zone_low"] if zone["zone_low"] is not None else current - atr15
+        sl = min(current - 0.35 * atr15, sl_anchor - 0.10 * atr15)
+        risk = max(current - sl, 0.25 * atr15)
+        tp = current + 2.0 * risk
     elif final == "SHORT":
-        sl = current + 1.0 * atr15
-        tp = current - 2.0 * atr15
+        zone = packet["smc"]["bearish_entry"]
+        sl_anchor = zone["zone_high"] if zone["zone_high"] is not None else current + atr15
+        sl = max(current + 0.35 * atr15, sl_anchor + 0.10 * atr15)
+        risk = max(sl - current, 0.25 * atr15)
+        tp = current - 2.0 * risk
     else:
         sl = None
         tp = None
@@ -1191,6 +1579,19 @@ def run_multi_agent(symbol, scanner_score_value):
         "sl": sl,
         "tp": tp,
         "rr": rr,
+        "entry_status": timing,
+        "entry_zone_low": (
+            packet["smc"]["bullish_entry"]["zone_low"] if final == "LONG"
+            else packet["smc"]["bearish_entry"]["zone_low"] if final == "SHORT"
+            else None
+        ),
+        "entry_zone_high": (
+            packet["smc"]["bullish_entry"]["zone_high"] if final == "LONG"
+            else packet["smc"]["bearish_entry"]["zone_high"] if final == "SHORT"
+            else None
+        ),
+        "smc_score": packet["smc"]["smc_score"],
+        "smc_bias": packet["smc"]["structure"]["bias"],
         "model_tiers": MODEL_TIERS,
     }
 
@@ -1206,8 +1607,9 @@ def save_signal(result):
         INSERT INTO signals
         (created_at,symbol,timeframe,scanner_score,final_decision,
          confidence,entry,stop_loss,take_profit,risk_reward,
-         market_regime,score_consensus,reasoning)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+         market_regime,score_consensus,reasoning,smc_score,entry_status,
+         entry_zone_low,entry_zone_high,smc_bias)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             now,
@@ -1223,6 +1625,11 @@ def save_signal(result):
             result["packet"]["market_regime"],
             result["scanner_score"],
             result["portfolio"]["reasoning"],
+            result.get("smc_score"),
+            result.get("entry_status"),
+            result.get("entry_zone_low"),
+            result.get("entry_zone_high"),
+            result.get("smc_bias"),
         ),
     )
 
@@ -1419,267 +1826,6 @@ def performance():
         "rows": closed,
     }
 
-
-# -------------------------
-# V5.5 Performance Lab / Trade Journal
-# -------------------------
-def journal_rows(limit=500):
-    con = db()
-    rows = con.execute(
-        """
-        SELECT * FROM signals
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (int(limit),),
-    ).fetchall()
-    con.close()
-    return rows
-
-
-def performance_advanced():
-    """Return research-grade paper-trading statistics from closed signals.
-    Results are descriptive only; no claim of predictive edge is made.
-    """
-    con = db()
-    closed = con.execute(
-        """
-        SELECT * FROM signals
-        WHERE result IN ('TP','SL')
-        ORDER BY id ASC
-        """
-    ).fetchall()
-    open_rows = con.execute(
-        """
-        SELECT * FROM signals
-        WHERE result IS NULL AND final_decision IN ('LONG','SHORT')
-        ORDER BY id ASC
-        """
-    ).fetchall()
-    con.close()
-
-    rs = [float(r['r_multiple'] or 0) for r in closed]
-    wins = [x for x in rs if x > 0]
-    losses = [x for x in rs if x < 0]
-    total_r = sum(rs)
-    expectancy = total_r / len(rs) if rs else 0.0
-    gross_profit = sum(wins)
-    gross_loss = abs(sum(losses))
-    pf = gross_profit / gross_loss if gross_loss else (float('inf') if gross_profit else 0.0)
-
-    equity = []
-    cur = 0.0
-    peak = 0.0
-    max_dd = 0.0
-    for x in rs:
-        cur += x
-        peak = max(peak, cur)
-        max_dd = min(max_dd, cur - peak)
-        equity.append(cur)
-
-    durations = []
-    for r in closed:
-        try:
-            if r['created_at'] and r['closed_at']:
-                a = datetime.fromisoformat(r['created_at'].replace('Z', '+00:00'))
-                b = datetime.fromisoformat(r['closed_at'].replace('Z', '+00:00'))
-                durations.append(max(0, (b-a).total_seconds()/3600))
-        except Exception:
-            pass
-
-    by_side = {}
-    for side in ('LONG','SHORT'):
-        vals = [float(r['r_multiple'] or 0) for r in closed if r['final_decision'] == side]
-        by_side[side] = {
-            'count': len(vals),
-            'win_rate': (sum(x > 0 for x in vals)/len(vals)*100) if vals else 0,
-            'avg_r': (sum(vals)/len(vals)) if vals else 0,
-            'total_r': sum(vals),
-        }
-
-    # Confidence calibration buckets: did higher-confidence signals actually
-    # perform better? This is descriptive, not a guarantee.
-    buckets = []
-    for lo, hi in ((50,59),(60,69),(70,79),(80,89),(90,100)):
-        vals = [float(r['r_multiple'] or 0) for r in closed if lo <= float(r['confidence'] or 0) <= hi]
-        buckets.append({
-            'bucket': f'{lo}-{hi}',
-            'count': len(vals),
-            'win_rate': (sum(x > 0 for x in vals)/len(vals)*100) if vals else 0,
-            'avg_r': (sum(vals)/len(vals)) if vals else 0,
-        })
-
-    return {
-        'closed': len(closed),
-        'open': len(open_rows),
-        'wins': len(wins),
-        'losses': len(losses),
-        'win_rate': (len(wins)/len(rs)*100) if rs else 0,
-        'avg_r': expectancy,
-        'expectancy_r': expectancy,
-        'profit_factor': pf,
-        'total_r': total_r,
-        'max_drawdown_r': abs(max_dd),
-        'avg_duration_h': sum(durations)/len(durations) if durations else 0,
-        'equity': equity,
-        'closed_rows': closed,
-        'open_rows': open_rows,
-        'by_side': by_side,
-        'confidence_buckets': buckets,
-    }
-
-
-def agent_performance():
-    """Evaluate each agent vote against the eventual paper-trade outcome."""
-    con = db()
-    rows = con.execute(
-        """
-        SELECT av.agent, av.decision, s.result, s.r_multiple
-        FROM agent_votes av
-        JOIN signals s ON s.id = av.signal_id
-        WHERE s.result IN ('TP','SL')
-        ORDER BY av.id ASC
-        """
-    ).fetchall()
-    con.close()
-
-    grouped = {}
-    for r in rows:
-        agent = r['agent']
-        grouped.setdefault(agent, []).append(r)
-
-    out = []
-    for agent, vals in grouped.items():
-        considered = [v for v in vals if v['decision'] in ('LONG','SHORT')]
-        # A directional vote is considered correct when it matches the side
-        # of the trade and the trade ultimately wins. WAIT is reported separately.
-        signal_correct = 0
-        directional = 0
-        total_r = 0.0
-        for v in vals:
-            if v['decision'] == 'WAIT':
-                continue
-            directional += 1
-            trade_won = v['result'] == 'TP'
-            signal_side = v['decision']
-            # The saved signal's side is needed to know whether the agent agreed
-            # with the executed direction. Fetch it below in a separate query.
-        out.append((agent, len(vals)))
-
-    # Better query with final side included.
-    con = db()
-    rows = con.execute(
-        """
-        SELECT av.agent, av.decision, s.final_decision, s.result, s.r_multiple
-        FROM agent_votes av
-        JOIN signals s ON s.id = av.signal_id
-        WHERE s.result IN ('TP','SL')
-        """
-    ).fetchall()
-    con.close()
-    grouped = {}
-    for r in rows:
-        grouped.setdefault(r['agent'], []).append(r)
-
-    result = []
-    for agent, vals in grouped.items():
-        non_wait = [v for v in vals if v['decision'] in ('LONG','SHORT')]
-        aligned = [v for v in non_wait if v['decision'] == v['final_decision']]
-        # Actual winning direction is derived from the executed paper trade:
-        # TP means the final side was right; SL means the opposite side was right.
-        # This lets us compare an agent's directional thesis with the observed
-        # outcome without pretending that WAIT is a directional prediction.
-        correct = 0
-        for v in non_wait:
-            actual_direction = v['final_decision'] if v['result'] == 'TP' else (
-                'SHORT' if v['final_decision'] == 'LONG' else 'LONG'
-            )
-            if v['decision'] == actual_direction:
-                correct += 1
-        avg_r = sum(float(v['r_multiple'] or 0) for v in vals) / len(vals) if vals else 0
-        result.append({
-            'agent': agent,
-            'votes': len(vals),
-            'directional_votes': len(non_wait),
-            'wait_rate': (sum(v['decision']=='WAIT' for v in vals)/len(vals)*100) if vals else 0,
-            'aligned_final': (len(aligned)/len(non_wait)*100) if non_wait else 0,
-            'outcome_accuracy': (correct/len(non_wait)*100) if non_wait else 0,
-            'avg_signal_r': avg_r,
-        })
-    return sorted(result, key=lambda x: x['outcome_accuracy'], reverse=True)
-
-
-def render_performance_lab():
-    st.subheader('🧪 V5.5 Performance Lab')
-    st.caption('Dashboard ini mengevaluasi PAPER TRADE yang sudah benar-benar ditutup. Belum ada klaim bahwa sistem memiliki edge.')
-    adv = performance_advanced()
-
-    if adv['closed'] == 0:
-        st.info('Belum ada paper trade tertutup. Jalankan analisis, simpan signal LONG/SHORT, lalu gunakan UPDATE PAPER TRADES setelah harga bergerak.')
-        if adv['open_rows']:
-            st.markdown('#### 📂 Open Paper Trades')
-            st.dataframe(pd.DataFrame([{
-                'ID': r['id'], 'Symbol': r['symbol'], 'Side': r['final_decision'],
-                'Confidence': round(float(r['confidence'] or 0)), 'Entry': r['entry'],
-                'SL': r['stop_loss'], 'TP': r['take_profit'], 'Regime': r['market_regime']
-            } for r in adv['open_rows']]), use_container_width=True, hide_index=True)
-        return
-
-    c = st.columns(7)
-    c[0].metric('Closed', adv['closed'])
-    c[1].metric('Win Rate', f"{adv['win_rate']:.1f}%")
-    c[2].metric('Expectancy', f"{adv['expectancy_r']:+.2f}R")
-    pf = '∞' if math.isinf(adv['profit_factor']) else f"{adv['profit_factor']:.2f}"
-    c[3].metric('Profit Factor', pf)
-    c[4].metric('Total R', f"{adv['total_r']:+.1f}R")
-    c[5].metric('Max DD', f"-{adv['max_drawdown_r']:.1f}R")
-    c[6].metric('Open', adv['open'])
-
-    # Equity curve
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        y=adv['equity'],
-        mode='lines+markers',
-        name='Cumulative R',
-    ))
-    fig.add_hline(y=0, line_dash='dot')
-    fig.update_layout(height=320, title='Paper Equity Curve (R)', xaxis_title='Closed Trade', yaxis_title='Cumulative R')
-    st.plotly_chart(fig, use_container_width=True)
-
-    left, right = st.columns(2)
-    with left:
-        st.markdown('#### 📈 LONG vs SHORT')
-        st.dataframe(pd.DataFrame([
-            {'Side': side, **vals} for side, vals in adv['by_side'].items()
-        ]), use_container_width=True, hide_index=True)
-    with right:
-        st.markdown('#### 🎯 Confidence Calibration')
-        st.dataframe(pd.DataFrame(adv['confidence_buckets']), use_container_width=True, hide_index=True)
-
-    st.markdown('#### 🧠 Agent Performance')
-    agents = agent_performance()
-    if agents:
-        st.dataframe(pd.DataFrame(agents), use_container_width=True, hide_index=True)
-    else:
-        st.info('Belum cukup histori untuk mengukur performa agent.')
-
-    st.markdown('#### 📓 Trade Journal')
-    rows = []
-    for r in adv['closed_rows']:
-        rows.append({
-            'ID': r['id'],
-            'Waktu': r['created_at'][:19].replace('T',' '),
-            'Symbol': r['symbol'],
-            'Side': r['final_decision'],
-            'Confidence': round(float(r['confidence'] or 0)),
-            'Regime': r['market_regime'],
-            'Entry': r['entry'],
-            'Exit': r['exit_price'],
-            'Result': r['result'],
-            'R': float(r['r_multiple'] or 0),
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
 # -------------------------
 # Telegram
 # -------------------------
@@ -1716,6 +1862,9 @@ SCANNER: {result['scanner_score']}/100
 ⚖️ R:R: 1:{result['rr']:.1f}
 
 🧠 Market: {result['packet']['market_regime']}
+🏗️ Structure: {result['packet']['smc']['structure']['bias']} | BOS={result['packet']['smc']['structure']['bos']}
+🧱 SMC Score: {result['packet']['smc']['smc_score']}/100
+⏱️ Entry Timing: {result['entry_status']}
 📚 Order Imbalance: {result['packet']['order_book']['imbalance']:+.1%}
 🕯 Candle: {result['packet']['candlestick']['name']}
 
@@ -1735,8 +1884,8 @@ if "last_result" not in st.session_state:
 
 st.title("🧠 AI Consensus Trading V5.5")
 st.caption(
-    "Crypto Scanner → ⚡ Analyst → 🐂 Bull ↔ 🐻 Bear → 🧠 Research → 💹 Trader → "
-    "🛡️ Risk Team → 👨‍⚖️ Final Judge → Memory → Paper Trading"
+    "Crypto Scanner → 🏗️ Structure/Liquidity/OB-FVG/Execution → 🐂 Bull ↔ 🐻 Bear → "
+    "🧠 Research → 💹 Trader → 🛡️ Risk Team → 👨‍⚖️ Final Judge → Timing Gate → Paper Trading"
 )
 
 st.sidebar.header("🔎 Market Scanner")
@@ -1773,9 +1922,9 @@ if GROQ_KEYS:
 else:
     st.sidebar.caption("Tambahkan GROQ_API_KEY atau GROQ_API_KEYS di Streamlit Secrets.")
 st.sidebar.caption("Arsitektur model: ringan → menengah → kuat → terbaik")
-st.sidebar.caption(f"⚡ Analyst: {ANALYST_MODEL} | reasoning low")
-st.sidebar.caption(f"🧠 Bull/Bear: {DEBATE_MODEL} | structured debate")
-st.sidebar.caption(f"🧠🧠 Research: {RESEARCH_MODEL} | reasoning low + strict JSON")
+st.sidebar.caption(f"⚡ Analysts: {ANALYST_MODEL} | reasoning low")
+st.sidebar.caption(f"🐂🐻 Bull/Bear: {DEBATE_MODEL} | reasoning none")
+st.sidebar.caption(f"🧠 Research: {RESEARCH_MODEL} | reasoning low + strict JSON")
 st.sidebar.caption(f"👨‍⚖️ Judge: {JUDGE_MODEL} | reasoning low + strict JSON")
 st.sidebar.caption("Output agent dipadatkan agar hemat token dan mengurangi TPM rate-limit.")
 st.sidebar.caption(f"⏱️ Jeda AI: {GROQ_MIN_DELAY:.1f}s | Retry 429: aktif")
@@ -1793,7 +1942,7 @@ if not TG_TOKEN or not TG_CHAT:
     )
 
 if st.sidebar.button("📨 Test Telegram", use_container_width=True):
-    ok, msg = telegram("✅ TEST AI CONSENSUS TRADING V5.5\nTelegram berhasil terhubung.")
+    ok, msg = telegram("✅ TEST AI CONSENSUS TRADING V5.3\nTelegram berhasil terhubung.")
     st.sidebar.success(msg) if ok else st.sidebar.error(msg)
 
 st.sidebar.divider()
@@ -1841,7 +1990,7 @@ if st.session_state.get("confirm_reset", False):
 # -------------------------
 perf = performance()
 
-st.subheader("📊 V5.5 Performance Lab")
+st.subheader("📊 V5.5 Performance Memory")
 
 p1, p2, p3, p4, p5 = st.columns(5)
 p1.metric("Signal Closed", perf["closed"])
@@ -1851,8 +2000,21 @@ p4.metric("Average R", f"{perf['avg_r']:+.2f}R")
 pf = "∞" if math.isinf(perf["profit_factor"]) else f"{perf['profit_factor']:.2f}"
 p5.metric("Profit Factor", pf)
 
-with st.expander("🧪 Buka V5.5 Performance Lab", expanded=True):
-    render_performance_lab()
+latest_smc = None
+try:
+    con = db()
+    latest_smc = con.execute(
+        "SELECT smc_score, entry_status, smc_bias FROM signals "
+        "WHERE smc_score IS NOT NULL ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    con.close()
+except Exception:
+    latest_smc = None
+if latest_smc:
+    q1, q2, q3 = st.columns(3)
+    q1.metric("Latest SMC Score", f"{float(latest_smc['smc_score'] or 0):.0f}/100")
+    q2.metric("Entry Timing", latest_smc["entry_status"] or "-")
+    q3.metric("SMC Bias", latest_smc["smc_bias"] or "-")
 
 st.divider()
 
@@ -1862,7 +2024,7 @@ st.divider()
 if not st.session_state.scan:
     st.info(
         "Klik **SCAN MARKET** untuk mencari kandidat crypto. "
-        "V5.5 tidak mengeksekusi order."
+        "V5.3 tidak mengeksekusi order."
     )
 else:
     st.subheader("🔥 Top Kandidat")
@@ -1972,6 +2134,28 @@ else:
             )
         )
 
+        # V5.5 visual timing zones. These are guidance zones, not guaranteed support/resistance.
+        bull_zone = result["packet"]["smc"]["bullish_entry"]
+        bear_zone = result["packet"]["smc"]["bearish_entry"]
+        if bull_zone["zone_low"] is not None and bull_zone["zone_high"] is not None:
+            fig.add_hrect(
+                y0=bull_zone["zone_low"],
+                y1=bull_zone["zone_high"],
+                line_width=1,
+                opacity=0.12,
+                annotation_text="Bullish OB/FVG",
+                annotation_position="top left",
+            )
+        if bear_zone["zone_low"] is not None and bear_zone["zone_high"] is not None:
+            fig.add_hrect(
+                y0=bear_zone["zone_low"],
+                y1=bear_zone["zone_high"],
+                line_width=1,
+                opacity=0.12,
+                annotation_text="Bearish OB/FVG",
+                annotation_position="bottom left",
+            )
+
         fig.update_layout(
             height=500,
             template="plotly_dark",
@@ -1981,6 +2165,38 @@ else:
         st.plotly_chart(
             fig,
             use_container_width=True,
+        )
+
+        st.markdown("### 🧱 Smart Money / Entry Timing")
+        smc = result["packet"]["smc"]
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        sc1.metric("Structure", smc["structure"]["bias"])
+        sc2.metric("BOS / CHOCH", f"{smc['structure']['bos']} / {smc['structure']['choch']}")
+        sc3.metric("SMC Score", f"{smc['smc_score']}/100")
+        sc4.metric("Timing", smc["timing"])
+
+        z1, z2 = st.columns(2)
+        with z1:
+            b = smc["bullish_entry"]
+            st.write(
+                f"**🟢 Bullish Entry Zone:** "
+                f"{b['zone_low'] if b['zone_low'] is not None else '-'} → "
+                f"{b['zone_high'] if b['zone_high'] is not None else '-'} | "
+                f"Quality {b['quality']}/100 | {b['status']}"
+            )
+        with z2:
+            b = smc["bearish_entry"]
+            st.write(
+                f"**🔴 Bearish Entry Zone:** "
+                f"{b['zone_low'] if b['zone_low'] is not None else '-'} → "
+                f"{b['zone_high'] if b['zone_high'] is not None else '-'} | "
+                f"Quality {b['quality']}/100 | {b['status']}"
+            )
+        st.caption(
+            f"Liquidity sweep high={smc['liquidity']['sweep_high']} | "
+            f"sweep low={smc['liquidity']['sweep_low']} | "
+            f"Displacement body={smc['displacement']['body_ratio']:.2f} | "
+            f"volume={smc['displacement']['volume_ratio']:.2f}x"
         )
 
         # Analyst team
@@ -2139,7 +2355,7 @@ else:
             ):
                 signal_id = save_signal(result)
                 st.success(
-                    f"Signal tersimpan ke Trade Journal V5.5. ID: {signal_id}"
+                    f"Signal tersimpan ke memory V5.3. ID: {signal_id}"
                 )
 
                 if tg_on:
@@ -2158,7 +2374,7 @@ else:
             ):
                 signal_id = save_signal(result)
                 st.success(
-                    f"WAIT tersimpan ke Trade Journal V5.5. ID: {signal_id}"
+                    f"WAIT tersimpan ke memory V5. ID: {signal_id}"
                 )
 
         with st.expander("🔍 Lihat data multi-timeframe"):
@@ -2176,7 +2392,8 @@ history = con.execute(
     """
     SELECT id, created_at, symbol, final_decision,
            confidence, entry, stop_loss, take_profit,
-           result, r_multiple, market_regime
+           result, r_multiple, market_regime,
+           smc_score, entry_status
     FROM signals
     ORDER BY id DESC
     LIMIT 100
@@ -2200,6 +2417,8 @@ if history:
             "Result": x["result"] or "OPEN",
             "R": x["r_multiple"],
             "Regime": x["market_regime"],
+            "SMC": x["smc_score"] if "smc_score" in x.keys() else None,
+            "Entry Status": x["entry_status"] if "entry_status" in x.keys() else None,
         })
 
     st.dataframe(
