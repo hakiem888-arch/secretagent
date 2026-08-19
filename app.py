@@ -322,16 +322,22 @@ def _pct_distance(a, b):
     return abs(a - b) / max(abs(b), 1e-12) * 100.0
 
 def _find_pivots(df, left=2, right=2, lookback=100):
-    d = _closed_df(df).tail(lookback).reset_index(drop=False)
+    # Binance klines keep a real `time` column, while the DataFrame index is
+    # also datetime.  The old reset_index(drop=False) tried to insert the
+    # index under the name `time`, colliding with the existing column.
+    # Keep the timestamp explicitly under a different name instead.
+    d = _closed_df(df).tail(lookback).copy()
+    d["timestamp"] = d.index.astype(str)
+    d = d.reset_index(drop=True)
     highs = []
     lows = []
     for i in range(left, len(d) - right):
         h = float(d.loc[i, "High"])
         l = float(d.loc[i, "Low"])
         if h >= float(d.loc[i-left:i+right, "High"].max()):
-            highs.append({"i": i, "price": h, "time": str(d.loc[i, "index"])})
+            highs.append({"i": i, "price": h, "time": d.loc[i, "timestamp"]})
         if l <= float(d.loc[i-left:i+right, "Low"].min()):
-            lows.append({"i": i, "price": l, "time": str(d.loc[i, "index"])})
+            lows.append({"i": i, "price": l, "time": d.loc[i, "timestamp"]})
     return highs, lows
 
 def _detect_structure(df):
