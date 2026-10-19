@@ -5171,206 +5171,81 @@ def run_cli_entrypoint(argv=None, print_output=False, sleep_fn=time.sleep):
 # -------------------------
 def render_app():
     _configure_page()
-
     ensure_analysis_state(st.session_state)
 
-    st.title("🧠 AI Consensus Trading V5.5")
+    st.title("🚨 Momentum Radar")
     st.caption(
-        "Crypto Scanner → 🚨 Pattern Radar → 🏗️ Structure/Liquidity/OB-FVG/Execution → 🐂 Bull ↔ 🐻 Bear → "
-        "🧠 Research → 💹 Trader → 🛡️ Risk Team → 👨‍⚖️ Final Judge → 3 Trading Modes → Paper Trading"
+        "Pantau momentum crypto multi-timeframe, temukan setup yang berkembang, "
+        "dan validasi peluang dengan AI. Semua transaksi bersifat paper trading."
     )
 
-    st.sidebar.header("🔎 Market Scanner")
-    scan_n = st.sidebar.slider("Koin yang discan", 20, 100, 60)
-    top_n = st.sidebar.slider("Kandidat dianalisis AI", 1, 3, 1)
-
-    def _trigger_market_scan(num_coins):
-        ok, status = binance_health()
-        if not ok:
-            st.error(
-                "❌ Binance Public Market Data tidak dapat diakses. "
-                f"Detail: {status}"
-            )
-            return
-        with st.spinner(f"🛰️ Memindai {num_coins} koin dengan volume, flow, dan momentum terbaik..."):
-            try:
-                if _scan_mod is not None and hasattr(globals().get("GLOBAL_REQUEST_BUDGET"), "reset_cycle"):
-                    GLOBAL_REQUEST_BUDGET.reset_cycle(max_requests_per_cycle=1000, max_weight_per_cycle=5000, preserve_cooldown=False)
-                scanned = scan_markets(num_coins)
-                if scanned:
-                    st.session_state.scan = scanned
-                else:
-                    diag = st.session_state.get("last_scan_diagnostics") or {}
-                    failed_list = diag.get("failed_symbols") or []
-                    err_hint = failed_list[0].get("message", "Tidak ada pasangan yang lolos filter") if failed_list else "Tidak ada pasangan yang lolos filter"
-                    st.warning(f"⚠️ Pemindaian selesai tetapi belum menghasilkan kandidat ({err_hint}). Silakan coba lagi.")
-            except Exception as e:
-                st.error(f"Scanner gagal: {_safe_ui_error(e)}")
-
-    if st.sidebar.button("🔍 SCAN MARKET", use_container_width=True):
-        _trigger_market_scan(scan_n)
-
-    st.sidebar.divider()
-    st.sidebar.header("🤖 AI")
-    st.sidebar.write(
-        "Groq:",
-        "🟢 SIAP" if GROQ_KEYS else "🔴 BELUM ADA"
-    )
-    if GROQ_KEYS:
-        active_key = int(st.session_state.get("_active_groq_key", 0)) % len(GROQ_KEYS)
-        available = sum(not _key_disabled("groq", i) for i in range(len(GROQ_KEYS)))
-        st.sidebar.caption(
-            f"🔑 API keys: {len(GROQ_KEYS)} | tersedia sekarang: {available} | aktif: #{active_key + 1}"
-        )
-    else:
-        st.sidebar.caption("Tambahkan GROQ_API_KEY atau GROQ_API_KEYS di Streamlit Secrets.")
+    # Sidebar: keep only the controls needed for the momentum workflow.
+    st.sidebar.title("⚙️ Kontrol")
+    st.sidebar.caption("AI: 🟢 Groq siap" if GROQ_KEYS else "AI: 🔴 Groq belum dikonfigurasi")
     st.sidebar.checkbox(
-        "🎯 Mode AI Proaktif (Ambil Keputusan LONG/SHORT)",
-        value=True,
+        "Mode AI proaktif",
+        value=bool(st.session_state.get("v6_proactive_ai_mode", True)),
         key="v6_proactive_ai_mode",
-        help="Jika aktif, AI Council secara tegas memutuskan LONG atau SHORT beserta level Entry, SL, dan TP tanpa tertahan WAIT_RETEST.",
+        help="AI memilih LONG atau SHORT beserta level Entry, SL, dan TP saat setup memenuhi syarat.",
     )
-    st.sidebar.caption("V5.6: Mode AI Proaktif memastikan keputusan LONG/SHORT selalu dihasilkan dari keunggulan arah.")
-    st.sidebar.caption(
-        f"⚡ Analysts: {ANALYST_MODEL} | cap={ resolve_effective_max_tokens('analyst') } tok | reasoning low"
-    )
-    st.sidebar.caption(
-        f"🐂🐻 Bull/Bear: {DEBATE_MODEL} | cap={ resolve_effective_max_tokens('debate') } tok | reasoning low"
-    )
-    st.sidebar.caption(
-        f"🧠 Research: {RESEARCH_MODEL} | cap={ resolve_effective_max_tokens('research') } tok | strict JSON"
-    )
-    st.sidebar.caption(
-        f"💹 Trader/Risk: cap={ resolve_effective_max_tokens('analyst', TRADER_MAX_TOKENS) }/{ resolve_effective_max_tokens('analyst', RISK_MAX_TOKENS) } tok (floor={MIN_COMPLETION_TOKENS})"
-    )
-    st.sidebar.caption(
-        f"👨‍⚖️ Judge: {JUDGE_MODEL} | cap={ resolve_effective_max_tokens('judge') } tok | strict JSON"
-    )
-    st.sidebar.caption(
-        f"🛡️ Cap per kandidat: {MAX_AI_CALLS_PER_CANDIDATE} logis / {_resolve_physical_cap()} fisik | SDK retry=0"
-    )
-    st.sidebar.caption(f"⏱️ Jeda AI: {GROQ_MIN_DELAY:.1f}s | Timeout: {AI_HTTP_TIMEOUT_SECONDS:.0f}s")
-
-    st.sidebar.divider()
-    st.sidebar.header("📱 Telegram")
     tg_on = st.sidebar.checkbox(
         "Kirim alert Telegram",
-        bool(TG_TOKEN and TG_CHAT),
+        value=bool(TG_TOKEN and TG_CHAT),
+        key="v56_tg_alerts",
     )
-
     if not TG_TOKEN or not TG_CHAT:
-        st.sidebar.caption(
-            "Telegram belum dikonfigurasi — V5 tetap bisa digunakan."
-        )
+        st.sidebar.caption("Telegram belum dikonfigurasi.")
 
-    if st.sidebar.button("📨 Test Telegram", use_container_width=True):
-        ok, msg = telegram("✅ TEST AI CONSENSUS TRADING V5.3\nTelegram berhasil terhubung.")
-        st.sidebar.success(msg) if ok else st.sidebar.error(msg)
+    with st.sidebar.expander("Pengaturan & tools", expanded=False):
+        if st.button("📨 Test Telegram", use_container_width=True, key="momentum_test_telegram"):
+            ok, msg = telegram("✅ TEST MOMENTUM RADAR\nTelegram berhasil terhubung.")
+            st.success(msg) if ok else st.error(msg)
 
-    st.sidebar.divider()
-    st.sidebar.header("🧪 Paper Trading")
+        if st.button("🔄 Perbarui paper trades", use_container_width=True, key="momentum_update_paper"):
+            with st.spinner("Memeriksa TP/SL paper trade..."):
+                updates = update_paper_trades()
+            if updates:
+                for symbol, result, r in updates:
+                    st.success(f"{symbol}: {result} ({r:+.1f}R)")
+            else:
+                st.info("Belum ada trade yang mencapai TP/SL.")
 
-    if st.sidebar.button(
-        "🔄 UPDATE PAPER TRADES",
-        use_container_width=True,
-    ):
-        with st.spinner("Memeriksa TP/SL paper trade yang masih terbuka..."):
-            updates = update_paper_trades()
+        st.divider()
+        if st.button("🧹 Reset database", use_container_width=True, key="momentum_reset_database"):
+            st.session_state.confirm_reset = True
 
-        if updates:
-            for symbol, result, r in updates:
-                st.sidebar.success(
-                    f"{symbol}: {result} ({r:+.1f}R)"
-                )
-        else:
-            st.sidebar.info("Belum ada trade yang mencapai TP/SL.")
+        if st.session_state.get("confirm_reset", False):
+            st.warning("Reset akan menghapus histori signal, agent votes, memory, pattern events, dan cache sesi aktif.")
+            confirm_col, cancel_col = st.columns(2)
+            if confirm_col.button("Ya, reset", key="momentum_confirm_reset"):
+                reset_all_trading_state(state=st.session_state, confirmed=True)
+                st.rerun()
+            if cancel_col.button("Batal", key="momentum_cancel_reset"):
+                st.session_state.confirm_reset = False
+                st.rerun()
 
-    if st.sidebar.button(
-        "🧹 RESET DATABASE V5",
-        use_container_width=True,
-    ):
-        st.session_state.confirm_reset = True
+        st.divider()
+        st.caption(f"Model analis: {ANALYST_MODEL}")
+        st.caption(f"Model riset: {RESEARCH_MODEL}")
+        st.caption(f"Jeda AI: {GROQ_MIN_DELAY:.1f}s · Timeout: {AI_HTTP_TIMEOUT_SECONDS:.0f}s")
 
-    if st.session_state.get("confirm_reset", False):
-        st.sidebar.warning(
-            "Ini akan menghapus histori signal, agent votes, memory, pattern_events, dan cache sesi aktif."
-        )
-        if st.sidebar.button("⚠️ YA, HAPUS SEMUA"):
-            reset_all_trading_state(state=st.session_state, confirmed=True)
-            st.rerun()
+    st.sidebar.caption("Paper trading saja. Sistem tidak mengirim order ke exchange.")
 
-    # -------------------------
-    # Performance dashboard
-    # -------------------------
-    perf = performance() or {}
-    closed_n = int(perf.get("closed", 0) or 0)
-    open_n = int(perf.get("open", 0) or 0)
-    win_rate_val = float(perf.get("win_rate", 0.0) or 0.0)
-    avg_r_val = float(perf.get("avg_r", 0.0) or 0.0)
-    pf_raw = perf.get("profit_factor")
-
-    st.subheader("📊 V5.6 Performance Memory (Legacy R-Snapshot)")
-    st.caption(
-        f"ℹ️ Mode Akuntansi: `{perf.get('accounting_mode', LEGACY_ACCOUNTING_MODE)}` (n={perf.get('sample_size', closed_n)} trade tertutup, "
-        f"{perf.get('observed_wait', 0)} observasi WAIT). {perf.get('accounting_disclaimer', '')} "
-        f"{perf.get('confidence_disclaimer', '')}"
+    # Main workflow: momentum is the primary and only discovery surface.
+    monitor_col1, monitor_col2, monitor_col3 = st.columns([1, 1, 1])
+    monitor_n = monitor_col1.slider("Pasangan dipantau", 4, 12, 8, key="v56_monitor_n")
+    monitor_auto = monitor_col2.checkbox("🔄 Auto monitor", value=False, key="v56_auto")
+    monitor_interval = monitor_col3.selectbox(
+        "Interval pembaruan",
+        [30, 45, 60, 90],
+        index=1,
+        format_func=lambda x: f"{x} detik",
+        key="v56_interval",
     )
-
-    p1, p2, p3, p4, p5 = st.columns(5)
-    p1.metric("Closed Trades (n)", closed_n)
-    p2.metric("Open Paper Trades", open_n)
-    p3.metric("Win Rate (R-based)", f"{win_rate_val:.1f}%")
-    p4.metric("Average R (Gross)", f"{avg_r_val:+.2f}R")
-    pf = (
-        "N/A"
-        if pf_raw is None or not _is_finite_number(pf_raw)
-        else f"{float(pf_raw):.2f}"
-    )
-    p5.metric("Profit Factor (R)", pf)
-
-    v6_perf = perf.get("v6_realistic") if isinstance(perf.get("v6_realistic"), dict) else None
-    if v6_perf is not None:
-        v6_an = v6_perf.get("analytics") or {}
-        v6_cal = v6_perf.get("calibration") or {}
-        st.caption(
-            f"📒 **V6 Realistic Paper Ledger (`{v6_perf.get('accounting_mode', REALISTIC_ACCOUNTING_MODE)}`)**: "
-            f"Equity=${v6_perf.get('current_equity', PAPER_INITIAL_EQUITY):,.2f} "
-            f"(Free=${v6_perf.get('free_equity', PAPER_INITIAL_EQUITY):,.2f}) | "
-            f"Net PnL=${v6_perf.get('total_net_pnl', 0.0):+,.2f} (Costs=${v6_perf.get('total_cost', 0.0):,.2f}) | "
-            f"Avg Net R={v6_perf.get('avg_net_r', 0.0):+.2f}R | "
-            f"Max DD={v6_an.get('max_drawdown_pct', 0.0):.2f}% | "
-            f"{v6_an.get('sample_warning', '')} | "
-            f"Kalibrasi: `{v6_cal.get('calibration_status', 'NO_DATA')}`"
+    with st.expander("Pengaturan validasi AI", expanded=False):
+        max_validations = st.slider(
+            "Maksimal validasi AI per siklus", 1, 2, 1, key="v56_max_ai"
         )
-
-    latest_smc = None
-    try:
-        con = db()
-        latest_smc = con.execute(
-            "SELECT smc_score, entry_status, smc_bias FROM signals "
-            "WHERE smc_score IS NOT NULL ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        con.close()
-    except Exception:
-        latest_smc = None
-    if latest_smc:
-        q1, q2, q3 = st.columns(3)
-        q1.metric("Latest SMC Score", f"{float(latest_smc['smc_score'] or 0):.0f}/100")
-        q2.metric("Entry Timing", latest_smc["entry_status"] or "-")
-        q3.metric("SMC Bias", latest_smc["smc_bias"] or "-")
-
-    st.divider()
-
-    # -------------------------
-    # V5.6 Momentum Monitor
-    # -------------------------
-    st.subheader("🚨 V5.6 Pattern & Momentum Monitor")
-    st.caption("Radar Python mencari pola lebih dulu. AI Council hanya dipanggil ketika setup cukup menarik; semua trade tetap PAPER.")
-    mc1, mc2, mc3 = st.columns(3)
-    monitor_n = mc1.slider("Pasangan yang dimonitor", 4, 12, 8, key="v56_monitor_n")
-    monitor_auto = mc2.checkbox("🔄 Auto monitor", value=False, key="v56_auto")
-    monitor_interval = mc3.selectbox("Interval", [30, 45, 60, 90], index=1, format_func=lambda x: f"{x} detik", key="v56_interval")
-    max_validations = st.slider("Maksimal validasi AI per siklus", 1, 2, 1, key="v56_max_ai")
 
     rt_mon = get_runtime_monitor_status(
         auto_enabled=monitor_auto,
@@ -5378,122 +5253,148 @@ def render_app():
     )
     if rt_mon.get("worker_alive"):
         st.success(
-            f"🟢 **Runtime Monitor: `{rt_mon.get('runtime_label', 'BACKGROUND_WORKER_ACTIVE')}`** "
-            f"(Worker `{rt_mon.get('worker_id')}` | Siklus={rt_mon.get('cycles_completed', 0)} | "
-            f"Heartbeat={rt_mon.get('heartbeat_age_seconds', 0.0):.1f}s lalu) — {rt_mon.get('disclaimer', '')}"
+            f"🟢 Monitor aktif · Siklus {rt_mon.get('cycles_completed', 0)} · "
+            f"Heartbeat {rt_mon.get('heartbeat_age_seconds', 0.0):.1f} detik lalu"
         )
     else:
         st.caption(
-            f"ℹ️ **Runtime Monitor: `{rt_mon.get('runtime_label', 'SESSION_ONLY')}`** "
-            f"(Mode=`{rt_mon.get('execution_mode', 'session_only')}`) — {rt_mon.get('disclaimer', '')}"
+            f"Status monitor: {rt_mon.get('runtime_label', 'SESSION_ONLY')} · "
+            "Aktifkan Auto monitor atau jalankan pemindaian manual."
         )
-
 
     def _run_v56_monitor():
         if "v56_processed_fingerprints" not in st.session_state:
             st.session_state.v56_processed_fingerprints = set()
-        with st.spinner("📡 Mencari pola BOS/CHOCH + liquidity + OB/FVG + displacement..."):
+
+        with st.spinner("Menganalisis momentum, struktur, liquidity, dan pola harga..."):
             snaps = momentum_candidates(monitor_n)
+
         if not snaps:
-            st.warning("Belum menemukan pasangan dengan data yang cukup.")
+            st.warning("Belum ada pasangan dengan data yang cukup. Coba lagi beberapa saat.")
             return
+
         rows = []
         for snap in snaps:
-            p = snap["pattern"]
+            pattern = snap["pattern"]
             rows.append({
-                "Symbol": snap["symbol"],
-                "State": p["state"],
-                "Direction": p["direction"],
-                "Score": p["score"],
+                "Pair": snap["symbol"],
+                "Setup": pattern["state"],
+                "Arah": pattern["direction"],
+                "Skor": pattern["score"],
                 "5M": snap["smc"]["5m"]["timing"],
                 "15M": snap["smc"]["15m"]["timing"],
                 "1H": snap["smc"]["1h"]["structure"]["bias"],
-                "24h": f"{snap['change']:+.2f}%",
+                "24H": f"{snap['change']:+.2f}%",
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-        _ui_state_priority = {"TRIGGERED": 2, "DEVELOPING": 1}
+        state_priority = {"TRIGGERED": 2, "DEVELOPING": 1}
         interesting = sorted(
             [x for x in snaps if x["pattern"]["state"] in {"DEVELOPING", "TRIGGERED"}],
             key=lambda x: (
-                _ui_state_priority.get(str(x.get("pattern", {}).get("state", "")).upper(), 0),
+                state_priority.get(str(x.get("pattern", {}).get("state", "")).upper(), 0),
                 float(x.get("pattern", {}).get("score", 0) or 0),
             ),
             reverse=True,
         )
         if not interesting:
-            st.info("👀 Belum ada setup yang cukup kuat. Sistem tetap memonitor; tidak memaksa entry.")
+            st.info("Belum ada setup momentum yang cukup kuat. Sistem tidak memaksakan entry.")
             return
 
-        st.markdown("### 🎯 Setup yang sedang berkembang")
+        st.markdown("### 🎯 Setup prioritas")
         validations = 0
         for snap in interesting:
             if validations >= max_validations:
                 break
-            p = snap["pattern"]
-            icon = "🔥" if p["state"] == "TRIGGERED" else "⚠️"
-            st.markdown(f"#### {icon} {snap['symbol']} — {p['state']} {p['score']}/100 — {p['direction']}")
-            st.caption(" • ".join(p["evidence"][:6]))
+
+            pattern = snap["pattern"]
+            icon = "🔥" if pattern["state"] == "TRIGGERED" else "👀"
+            st.markdown(
+                f"#### {icon} {snap['symbol']} · {pattern['state']} · "
+                f"{pattern['direction']} · {pattern['score']}/100"
+            )
+            if pattern.get("evidence"):
+                st.caption(" · ".join(pattern["evidence"][:4]))
+
             event_id, already_notified = save_pattern_event(snap)
-            fp = pattern_fingerprint(snap)
-            if fp in st.session_state.v56_processed_fingerprints:
-                st.info("Pattern ini sudah diproses pada siklus sebelumnya; menunggu perubahan struktur.")
+            fingerprint = pattern_fingerprint(snap)
+            if fingerprint in st.session_state.v56_processed_fingerprints:
+                st.info("Setup ini sudah diproses. Menunggu perubahan struktur.")
                 continue
 
             con = db()
-            event_row = con.execute("SELECT notified FROM pattern_events WHERE id=?", (event_id,)).fetchone()
+            event_row = con.execute(
+                "SELECT notified FROM pattern_events WHERE id=?", (event_id,)
+            ).fetchone()
             con.close()
-            if event_row and event_row["notified"] and p["state"] in {"TRIGGERED", "DEVELOPING"}:
-                st.info("Pattern ini sudah divalidasi/di-alert sebelumnya; menunggu fingerprint baru.")
+            if event_row and event_row["notified"] and pattern["state"] in {"TRIGGERED", "DEVELOPING"}:
+                st.info("Setup ini sudah divalidasi atau dikirim sebagai alert. Menunggu pola baru.")
                 continue
 
-            if p["state"] in {"TRIGGERED", "DEVELOPING"} and GROQ_KEYS:
+            if pattern["state"] in {"TRIGGERED", "DEVELOPING"} and GROQ_KEYS:
                 try:
                     result = run_and_store_candidate_analysis(
-                        snap["symbol"],
-                        p["score"],
-                        state=st.session_state,
+                        snap["symbol"], pattern["score"], state=st.session_state
                     )
                     validations += 1
-                    st.session_state.v56_processed_fingerprints.add(fp)
+                    st.session_state.v56_processed_fingerprints.add(fingerprint)
+
                     modes = result.get("modes", {})
-                    cols = st.columns(3)
-                    labels = [("scalping", "⚡ Scalping"), ("intraday", "📊 Intraday"), ("swing", "🌊 Swing")]
-                    for col, (key, label) in zip(cols, labels):
-                        m = modes.get(key, {"decision": "WAIT", "entry_action": "WAIT", "directional_bias": "UNKNOWN", "confidence": 0, "reason": "-"})
-                        act = m.get("entry_action", m.get("decision", "WAIT"))
-                        bias = m.get("directional_bias", "UNKNOWN")
-                        card_txt = f"**{label} — Action: {act} (Bias: {bias})**\n\nModel Score: {m['confidence']:.0f}/100\n\n{m['reason']}"
-                        if act == "LONG": col.success(card_txt)
-                        elif act == "SHORT": col.error(card_txt)
-                        else: col.warning(card_txt)
+                    mode_cols = st.columns(3)
+                    mode_labels = [
+                        ("scalping", "⚡ Scalping"),
+                        ("intraday", "📊 Intraday"),
+                        ("swing", "🌊 Swing"),
+                    ]
+                    for col, (mode_key, label) in zip(mode_cols, mode_labels):
+                        mode = modes.get(mode_key, {
+                            "decision": "WAIT", "entry_action": "WAIT",
+                            "directional_bias": "UNKNOWN", "confidence": 0, "reason": "-",
+                        })
+                        action = mode.get("entry_action", mode.get("decision", "WAIT"))
+                        bias = mode.get("directional_bias", "UNKNOWN")
+                        card_text = (
+                            f"**{label} · {action}**\n\n"
+                            f"Bias: {bias} · Skor: {mode.get('confidence', 0):.0f}/100\n\n"
+                            f"{mode.get('reason', '-')}"
+                        )
+                        if action == "LONG":
+                            col.success(card_text)
+                        elif action == "SHORT":
+                            col.error(card_text)
+                        else:
+                            col.warning(card_text)
 
                     gate_ok = bool(result.get("gate_report", {}).get("approved", False))
-                    if result["final"] in {"LONG", "SHORT"} and gate_ok:
-                        st.success(f"👨‍⚖️ Final Judge: {result['final']} — {result['portfolio']['confidence']:.0f}/100 | Timing: {result['entry_status']}")
+                    if result.get("final") in {"LONG", "SHORT"} and gate_ok:
+                        st.success(
+                            f"Final: {result['final']} · "
+                            f"Confidence {result['portfolio']['confidence']:.0f}/100 · "
+                            f"Timing {result.get('entry_status', '-')}"
+                        )
                         try:
                             save_out = save_rendered_analysis(
                                 result["analysis_id"],
                                 state=st.session_state,
                                 tg_enabled=tg_on and not already_notified,
                             )
-                            signal_id = save_out["signal_id"]
-                            st.caption(f"💾 Paper trade otomatis tersimpan. ID {signal_id}")
-                            if save_out["tg_sent"]:
+                            st.caption(f"Paper trade tersimpan · ID {save_out['signal_id']}")
+                            if save_out.get("tg_sent"):
                                 mark_pattern_notified(event_id)
-                                st.success("📱 Telegram: signal paper-trade terkirim.")
-                            elif tg_on and not already_notified and save_out["created_new"] and save_out["tg_msg"]:
+                                st.success("Alert Telegram terkirim.")
+                            elif tg_on and not already_notified and save_out.get("created_new") and save_out.get("tg_msg"):
                                 st.warning(f"Telegram belum terkirim: {save_out['tg_msg']}")
                         except Exception as save_err:
-                            st.warning(f"Paper trade terdeteksi tetapi gagal disimpan: {_safe_ui_error(save_err)}")
+                            st.warning(f"Setup valid, tetapi paper trade gagal disimpan: {_safe_ui_error(save_err)}")
                     else:
-                        st.warning(f"AI memvalidasi setup tetapi belum memberi entry: {result['portfolio']['confidence']:.0f}/100")
-                except Exception as e:
-                    st.error(f"AI validation gagal untuk {snap['symbol']}: {_safe_ui_error(e)}")
-            elif p["state"] == "TRIGGERED":
-                st.warning("Setup terpicu, tetapi Groq belum tersedia. Radar tidak membuka trade otomatis.")
+                        confidence = result.get("portfolio", {}).get("confidence", 0)
+                        st.warning(f"AI belum menyetujui entry. Confidence {confidence:.0f}/100.")
+                except Exception as exc:
+                    st.error(f"Validasi AI gagal untuk {snap['symbol']}: {_safe_ui_error(exc)}")
+            elif pattern["state"] == "TRIGGERED":
+                st.warning("Setup terpicu, tetapi Groq belum dikonfigurasi. AI belum memvalidasi entry.")
             else:
-                st.info("Setup berkembang. AI belum dipanggil untuk menghemat token; tunggu trigger lebih kuat.")
+                st.info("Setup berkembang. Validasi AI menunggu trigger yang lebih kuat.")
 
     if monitor_auto:
         if hasattr(st, "fragment"):
@@ -5502,570 +5403,73 @@ def render_app():
                 _run_v56_monitor()
             _auto_v56_fragment()
         else:
-            st.info("Auto monitor memerlukan Streamlit versi yang mendukung fragment. Gunakan tombol SCAN MOMENTUM di bawah.")
+            st.info("Auto monitor membutuhkan Streamlit yang mendukung fragment. Gunakan tombol scan manual.")
 
-    if st.button("🚨 SCAN MOMENTUM SEKARANG", use_container_width=True, key="v56_manual_scan"):
+    if st.button("🚨 Scan Momentum Sekarang", use_container_width=True, key="v56_manual_scan"):
         _run_v56_monitor()
 
-    st.divider()
-
-    # -------------------------
-    # Scanner results
-    # -------------------------
-    if not st.session_state.scan:
-        st.info(
-            "Klik **🔍 SCAN MARKET** di sidebar atau tombol di bawah untuk mencari kandidat crypto. "
-            "Sistem hanya melakukan paper-trading (tidak mengeksekusi order otomatis)."
-        )
-        if st.button("🔍 SCAN MARKET SEKARANG", use_container_width=True, key="main_scan_market_btn"):
-            _trigger_market_scan(scan_n)
-            if st.session_state.scan and hasattr(st, "rerun"):
-                st.rerun()
-    else:
-        st.subheader("🔥 Top Kandidat")
-
-        rows = []
-
-        for i, x in enumerate(st.session_state.scan[:10], 1):
-            rows.append({
-                "Rank": i,
-                "Symbol": x["symbol"],
-                "Score": x["score"],
-                "24h": f"{x['change']:+.2f}%",
-                "Volume 24h": f"${x['qvol']:,.0f}",
-                "Vol Ratio": f"{x['vr']:.2f}x",
-                "Buy Pressure": f"{x['buy']:.1%}",
-                "Order Imbalance": f"{x['imb']:+.1%}",
-                "RSI": f"{x['rsi']:.2f}",
-            })
-
-        st.dataframe(
-            pd.DataFrame(rows),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.divider()
-        st.subheader(f"🧠 TradingAgents-style Research — Top {top_n}")
-        st.caption(
-            "Analisis AI dipisahkan dari render UI (PH01-01): interaksi widget atau tombol Simpan "
-            "tidak memicu ulang panggilan LLM. Gunakan tombol eksplisit di bawah untuk menganalisis kandidat."
-        )
-
-        act_c1, act_c2 = st.columns(2)
-        if act_c1.button(
-            f"🧠 ANALISIS AI — TOP {top_n} KANDIDAT",
-            key="btn_analyze_top",
-            use_container_width=True,
-        ):
-            with st.spinner(f"🧠 Menjalankan analisis AI untuk Top {top_n} kandidat..."):
-                try:
-                    analyze_candidates_batch(
-                        st.session_state.scan,
-                        top_n,
-                        state=st.session_state,
-                        force_refresh=False,
-                    )
-                except Exception as e:
-                    st.error(f"Gagal menjalankan analisis Top {top_n}: {_safe_ui_error(e)}")
-
-        if act_c2.button(
-            f"🔄 REFRESH ULANG AI — TOP {top_n} KANDIDAT",
-            key="btn_refresh_top",
-            use_container_width=True,
-        ):
-            with st.spinner(f"🔄 Menyegarkan ulang analisis AI untuk Top {top_n} kandidat..."):
-                try:
-                    analyze_candidates_batch(
-                        st.session_state.scan,
-                        top_n,
-                        state=st.session_state,
-                        force_refresh=True,
-                    )
-                except Exception as e:
-                    st.error(f"Gagal menyegarkan analisis Top {top_n}: {_safe_ui_error(e)}")
-
-        for rank, candidate in enumerate(
-            st.session_state.scan[:top_n],
-            1,
-        ):
-            symbol = candidate["symbol"]
-
-            st.markdown(
-                f"## #{rank} {symbol} — Scanner {candidate['score']}/100"
-            )
-
-            existing_result = get_rendered_analysis(symbol=symbol, state=st.session_state)
-            btn_label = (
-                f"🔄 Refresh Analisis AI {symbol}"
-                if existing_result is not None
-                else f"🧠 Analisis AI {symbol}"
-            )
-            if st.button(btn_label, key=f"analyze_{symbol}_{rank}"):
-                with st.spinner(
-                    f"🧠 Menjalankan analyst team + bull/bear + risk team untuk {symbol}..."
-                ):
-                    try:
-                        existing_result = run_and_store_candidate_analysis(
-                            symbol,
-                            candidate["score"],
-                            state=st.session_state,
-                        )
-                    except Exception as e:
-                        st.error(f"Gagal menganalisis {symbol}: {_safe_ui_error(e)}")
-                        continue
-
-            result = get_rendered_analysis(symbol=symbol, state=st.session_state)
-            if result is None:
-                st.info(
-                    f"⏸️ **{symbol}** belum dianalisis AI pada sesi ini. "
-                    f"Klik **{btn_label}** atau **🧠 ANALISIS AI — TOP {top_n} KANDIDAT** untuk memulai."
-                )
-                st.divider()
-                continue
-
-            analysis_id = result["analysis_id"]
-            veto_str = _resolve_veto_reasons_str(result)
-            raw_dec_str = result.get("raw_model_decision", result["portfolio"]["decision"])
+    # Secondary information stays available without competing with the momentum workflow.
+    with st.expander("📊 Performa paper trading", expanded=False):
+        perf = performance() or {}
+        v6_perf = perf.get("v6_realistic") if isinstance(perf.get("v6_realistic"), dict) else None
+        if v6_perf is not None:
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("Equity", f"${v6_perf.get('current_equity', PAPER_INITIAL_EQUITY):,.2f}")
+            p2.metric("Net PnL", f"${v6_perf.get('total_net_pnl', 0.0):+,.2f}")
+            p3.metric("Trade terbuka", int(perf.get("open", 0) or 0))
+            p4.metric("Win rate", f"{float(perf.get('win_rate', 0.0) or 0.0):.1f}%")
+            analytics = v6_perf.get("analytics") or {}
             st.caption(
-                f"🆔 Analysis ID: `{analysis_id}` | "
-                f"🔑 Setup Key: `{result.get('idempotency_key', '-')}` | "
-                f"🕒 Waktu Analisis (UTC): {result.get('analyzed_at', '-')[:19].replace('T', ' ')} | "
-                f"🎯 Skor saat analisis: {result.get('scanner_score', candidate['score'])}/100 | "
-                f"🛡️ Raw Model: `{raw_dec_str}` → Gated: `{result['final']}` (Veto: `{veto_str}`)"
+                f"Max drawdown: {analytics.get('max_drawdown_pct', 0.0):.2f}% · "
+                f"Avg Net R: {v6_perf.get('avg_net_r', 0.0):+.2f}R · "
+                f"Mode: {v6_perf.get('accounting_mode', REALISTIC_ACCOUNTING_MODE)}"
             )
+        else:
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("Trade tertutup", int(perf.get("closed", 0) or 0))
+            p2.metric("Trade terbuka", int(perf.get("open", 0) or 0))
+            p3.metric("Win rate", f"{float(perf.get('win_rate', 0.0) or 0.0):.1f}%")
+            p4.metric("Average R", f"{float(perf.get('avg_r', 0.0) or 0.0):+.2f}R")
+        if perf.get("accounting_disclaimer"):
+            st.caption(perf["accounting_disclaimer"])
 
-            packet = result["packet"]
+    with st.expander("🧠 Riwayat sinyal", expanded=False):
+        con = db()
+        history = con.execute(
+            """
+            SELECT id, created_at, symbol, final_decision, confidence,
+                   entry, stop_loss, take_profit, result, r_multiple,
+                   market_regime, smc_score, entry_status, raw_model_decision,
+                   veto_reasons, accounting_mode
+            FROM signals
+            ORDER BY id DESC
+            LIMIT 100
+            """
+        ).fetchall()
+        con.close()
 
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Harga", f"${packet['price']:,.6f}")
-            c2.metric("Regime", packet["market_regime"])
-            c3.metric(
-                "Buy Pressure",
-                f"{packet['timeframes']['15m']['buy_pressure']:.1%}",
-            )
-            c4.metric(
-                "Order Book",
-                f"{packet['order_book']['imbalance']:+.1%}",
-            )
-            c5.metric(
-                "RSI 15m",
-                f"{packet['timeframes']['15m']['rsi']:.2f}",
-            )
-
-            # Candlestick chart
-            ch = result["frames"]["15m"].tail(100)
-
-            fig = go.Figure()
-
-            fig.add_trace(
-                go.Candlestick(
-                    x=ch.index,
-                    open=ch.Open,
-                    high=ch.High,
-                    low=ch.Low,
-                    close=ch.Close,
-                    name="Candlestick",
-                )
-            )
-
-            fig.add_trace(
-                go.Scatter(
-                    x=ch.index,
-                    y=ch.EMA20,
-                    name="EMA20",
-                )
-            )
-
-            fig.add_trace(
-                go.Scatter(
-                    x=ch.index,
-                    y=ch.EMA50,
-                    name="EMA50",
-                )
-            )
-
-            fig.add_trace(
-                go.Scatter(
-                    x=ch.index,
-                    y=ch.EMA200,
-                    name="EMA200",
-                )
-            )
-
-            smc_chart = result["packet"]["smc"]
-            for idx, z in enumerate(smc_chart.get("order_blocks", [])[:6]):
-                fig.add_hrect(
-                    y0=z["low"], y1=z["high"],
-                    line_width=1, opacity=0.10,
-                    annotation_text=f"OB {z['direction']}",
-                    annotation_position="left",
-                )
-            for idx, z in enumerate(smc_chart.get("fvgs", [])[:6]):
-                fig.add_hrect(
-                    y0=z["low"], y1=z["high"],
-                    line_width=1, opacity=0.06,
-                    annotation_text=f"FVG {z['direction']}",
-                    annotation_position="right",
-                )
-
-            bull_zone = result["packet"]["smc"]["bullish_entry"]
-            bear_zone = result["packet"]["smc"]["bearish_entry"]
-            if bull_zone["zone_low"] is not None and bull_zone["zone_high"] is not None:
-                fig.add_hrect(
-                    y0=bull_zone["zone_low"],
-                    y1=bull_zone["zone_high"],
-                    line_width=1,
-                    opacity=0.12,
-                    annotation_text="Bullish OB/FVG",
-                    annotation_position="top left",
-                )
-            if bear_zone["zone_low"] is not None and bear_zone["zone_high"] is not None:
-                fig.add_hrect(
-                    y0=bear_zone["zone_low"],
-                    y1=bear_zone["zone_high"],
-                    line_width=1,
-                    opacity=0.12,
-                    annotation_text="Bearish OB/FVG",
-                    annotation_position="bottom left",
-                )
-
-            fig.update_layout(
-                height=500,
-                template="plotly_dark",
-                xaxis_rangeslider_visible=False,
-            )
-
-            st.plotly_chart(
-                fig,
-                use_container_width=True,
-            )
-
-            st.markdown("### 🧱 Smart Money / Entry Timing")
-            smc = result["packet"]["smc"]
-            sc1, sc2, sc3, sc4 = st.columns(4)
-            sc1.metric("Structure", smc["structure"]["bias"])
-            sc2.metric("BOS / CHOCH", f"{smc['structure']['bos']} / {smc['structure']['choch']}")
-            sc3.metric("SMC Score", f"{smc['smc_score']}/100")
-            sc4.metric("Timing", smc["timing"])
-
-            z1, z2 = st.columns(2)
-            with z1:
-                b = smc["bullish_entry"]
-                st.write(
-                    f"**🟢 Bullish Entry Zone:** "
-                    f"{b['zone_low'] if b['zone_low'] is not None else '-'} → "
-                    f"{b['zone_high'] if b['zone_high'] is not None else '-'} | "
-                    f"Quality {b['quality']}/100 | {b['status']}"
-                )
-            with z2:
-                b = smc["bearish_entry"]
-                st.write(
-                    f"**🔴 Bearish Entry Zone:** "
-                    f"{b['zone_low'] if b['zone_low'] is not None else '-'} → "
-                    f"{b['zone_high'] if b['zone_high'] is not None else '-'} | "
-                    f"Quality {b['quality']}/100 | {b['status']}"
-                )
-            st.caption(
-                f"Liquidity sweep high={smc['liquidity']['sweep_high']} | "
-                f"sweep low={smc['liquidity']['sweep_low']} | "
-                f"Displacement body={smc['displacement']['body_ratio']:.2f} | "
-                f"volume={smc['displacement']['volume_ratio']:.2f}x"
-            )
-
-            # Analyst team
-            st.markdown("### 🧩 Analyst Team")
-
-            cols = st.columns(4)
-
-            for col, agent in zip(
-                cols,
-                result["analysts"],
-            ):
-                with col:
-                    if agent["decision"] == "LONG":
-                        col.success(
-                            f"**{agent['agent']} — LONG**\n\n"
-                            f"Confidence: {agent['confidence']:.0f}\n\n"
-                            f"{agent['reasoning']}"
-                        )
-                    elif agent["decision"] == "SHORT":
-                        col.error(
-                            f"**{agent['agent']} — SHORT**\n\n"
-                            f"Confidence: {agent['confidence']:.0f}\n\n"
-                            f"{agent['reasoning']}"
-                        )
-                    else:
-                        col.warning(
-                            f"**{agent['agent']} — WAIT**\n\n"
-                            f"Confidence: {agent['confidence']:.0f}\n\n"
-                            f"{agent['reasoning']}"
-                        )
-
-            # Bull vs Bear
-            st.markdown("### 🐂 Bull vs 🐻 Bear Debate")
-
-            b1, b2 = st.columns(2)
-
-            with b1:
-                st.markdown("#### 🐂 Bull Researcher")
-                st.write(
-                    f"**{result['bull']['decision']}** — "
-                    f"confidence {result['bull']['confidence']:.0f}"
-                )
-                st.write(result["bull"]["reasoning"])
-                st.caption("Risiko: " + result["bull"]["key_risk"])
-
-            with b2:
-                st.markdown("#### 🐻 Bear Researcher")
-                st.write(
-                    f"**{result['bear']['decision']}** — "
-                    f"confidence {result['bear']['confidence']:.0f}"
-                )
-                st.write(result["bear"]["reasoning"])
-                st.caption("Risiko: " + result["bear"]["key_risk"])
-
-            # Research manager + trader
-            st.markdown("### 🧠 Research Manager")
-
-            st.info(
-                f"**{result['research_manager']['decision']}** — "
-                f"confidence {result['research_manager']['confidence']:.0f}\n\n"
-                f"{result['research_manager']['reasoning']}"
-            )
-
-            st.markdown("### 💹 Trader Plan")
-
-            st.write(
-                f"**{result['trader']['decision']}** — "
-                f"confidence {result['trader']['confidence']:.0f}"
-            )
-            st.write(result["trader"]["reasoning"])
-            st.caption(
-                "Risiko Trader: "
-                + result["trader"]["key_risk"]
-            )
-
-            # Risk team
-            st.markdown("### 🛡️ Risk Debate")
-
-            rcols = st.columns(3)
-
-            for col, risk in zip(
-                rcols,
-                result["risk_agents"],
-            ):
-                with col:
-                    if risk["decision"] == "LONG":
-                        col.success(
-                            f"**{risk['agent']} — LONG**\n\n"
-                            f"{risk['reasoning']}"
-                        )
-                    elif risk["decision"] == "SHORT":
-                        col.error(
-                            f"**{risk['agent']} — SHORT**\n\n"
-                            f"{risk['reasoning']}"
-                        )
-                    else:
-                        col.warning(
-                            f"**{risk['agent']} — WAIT**\n\n"
-                            f"{risk['reasoning']}"
-                        )
-
-            # Final
-            st.markdown("### 👨‍⚖️ Portfolio Manager — Final Decision")
-
-            final = result["final"]
-
-            if final == "LONG":
-                st.success(
-                    f"🚀 **LONG {symbol}** — "
-                    f"confidence {result['portfolio']['confidence']:.0f}/100"
-                )
-            elif final == "SHORT":
-                st.error(
-                    f"🩸 **SHORT {symbol}** — "
-                    f"confidence {result['portfolio']['confidence']:.0f}/100"
-                )
-            else:
-                st.warning(
-                    f"⚖️ **WAIT {symbol}** — "
-                    f"confidence {result['portfolio']['confidence']:.0f}/100"
-                )
-
-            st.write(result["portfolio"]["reasoning"])
-            st.caption(
-                "Risiko final: "
-                + result["portfolio"]["key_risk"]
-            )
-
-            st.markdown("### 🎯 Tiga Trading Mode (Bias vs Entry Action)")
-            mode_cols = st.columns(3)
-            for col, (mode_key, mode_label) in zip(
-                mode_cols, (("scalping", "⚡ Scalping"), ("intraday", "📊 Intraday"), ("swing", "🌊 Swing"))
-            ):
-                m = result.get("modes", {}).get(
-                    mode_key,
-                    {
-                        "decision": "WAIT",
-                        "entry_action": "WAIT",
-                        "directional_bias": "UNKNOWN",
-                        "data_status": "INSUFFICIENT_DATA",
-                        "veto_codes": ["INSUFFICIENT_DATA"],
-                        "confidence": 0,
-                        "reason": "Tidak tersedia",
-                    },
-                )
-                act = m.get("entry_action", m.get("decision", "WAIT"))
-                bias = m.get("directional_bias", "UNKNOWN")
-                v_codes = ", ".join(m.get("veto_codes") or []) or "NONE"
-                m_levels_txt = ""
-                if act in {"LONG", "SHORT"} and _is_finite_number(m.get("entry")) and _is_finite_number(m.get("sl")) and _is_finite_number(m.get("tp")):
-                    m_levels_txt = (
-                        f"💰 Entry: `${float(m['entry']):,.6f}` | "
-                        f"🛑 SL: `${float(m['sl']):,.6f}` | "
-                        f"🎯 TP: `${float(m['tp']):,.6f}` (`1:{float(m.get('rr', 2.0)):.1f}`)\n\n"
-                    )
-                text = (
-                    f"**{mode_label} — Action: {act}**\n\n"
-                    f"Bias: `{bias}` | Data: `{m.get('data_status', '-')}` | Veto: `{v_codes}`\n\n"
-                    f"{m_levels_txt}"
-                    f"Skor Model: {m['confidence']:.0f}/100\n\n{m['reason']}"
-                )
-                if act == "LONG": col.success(text)
-                elif act == "SHORT": col.error(text)
-                else: col.warning(text)
-
-            if final in {"LONG", "SHORT"}:
-                e1, e2, e3, e4 = st.columns(4)
-
-                e1.metric(
-                    "Paper Entry",
-                    f"${result['entry']:,.8f}",
-                )
-                e2.metric(
-                    "Stop Loss",
-                    f"${result['sl']:,.8f}",
-                )
-                e3.metric(
-                    "Take Profit",
-                    f"${result['tp']:,.8f}",
-                )
-                e4.metric(
-                    "Risk / Reward",
-                    f"1:{result['rr']:.1f}",
-                )
-
-                st.warning(
-                    "⚠️ Ini PAPER TRADE. Tidak ada order Binance yang dieksekusi."
-                )
-
-                if st.button(
-                    f"💾 Simpan Signal {symbol}",
-                    key=f"save_{symbol}_{rank}",
-                ):
-                    save_outcome = save_rendered_analysis(
-                        analysis_id,
-                        state=st.session_state,
-                        tg_enabled=tg_on,
-                    )
-                    signal_id = save_outcome["signal_id"]
-                    if save_outcome["created_new"]:
-                        st.success(
-                            f"Signal tersimpan ke memory V5.6 (Analysis ID: {analysis_id}). ID: {signal_id}"
-                        )
-                    else:
-                        st.info(
-                            f"Signal untuk setup/Analysis ID {analysis_id} sudah tersimpan sebelumnya (ID: {signal_id}). Tidak membuat duplikat."
-                        )
-
-                    if tg_on and save_outcome["created_new"]:
-                        if save_outcome["tg_sent"]:
-                            st.success("📱 Alert Telegram terkirim.")
-                        else:
-                            st.error(f"Telegram gagal: {_safe_ui_error(save_outcome['tg_msg'])}")
-
-            else:
-                if st.button(
-                    f"💾 Simpan WAIT {symbol}",
-                    key=f"save_wait_{symbol}_{rank}",
-                ):
-                    save_outcome = save_rendered_analysis(
-                        analysis_id,
-                        state=st.session_state,
-                        tg_enabled=False,
-                    )
-                    signal_id = save_outcome["signal_id"]
-                    if save_outcome["created_new"]:
-                        st.success(
-                            f"WAIT tersimpan ke memory V5.6 (Analysis ID: {analysis_id} | Veto: {veto_str}). ID: {signal_id}"
-                        )
-                    else:
-                        st.info(
-                            f"WAIT untuk setup/Analysis ID {analysis_id} sudah tersimpan sebelumnya (ID: {signal_id}). Tidak membuat duplikat."
-                        )
-
-            with st.expander("🔍 Lihat data multi-timeframe"):
-                st.json(packet)
-
-            st.divider()
-
-    # -------------------------
-    # History
-    # -------------------------
-    st.subheader("🧠 Memory & Signal History")
-
-    con = db()
-    history = con.execute(
-        """
-        SELECT id, created_at, symbol, final_decision,
-               confidence, entry, stop_loss, take_profit,
-               result, r_multiple, market_regime,
-               smc_score, entry_status,
-               raw_model_decision, veto_reasons, accounting_mode
-        FROM signals
-        ORDER BY id DESC
-        LIMIT 100
-        """
-    ).fetchall()
-    con.close()
-
-    if history:
-        hist_rows = []
-
-        for x in history:
-            row_keys = x.keys()
-            hist_rows.append({
-                "ID": x["id"],
-                "Waktu": x["created_at"][:19].replace("T", " "),
-                "Symbol": x["symbol"],
-                "Raw Model": x["raw_model_decision"] if "raw_model_decision" in row_keys and x["raw_model_decision"] else x["final_decision"],
-                "Decision": x["final_decision"],
-                "Model Score": round(float(x["confidence"] or 0)),
-                "Entry": x["entry"],
-                "SL": x["stop_loss"],
-                "TP": x["take_profit"],
-                "Status": format_signal_history_status(x),
-                "R (Legacy)": x["r_multiple"],
-                "Veto": x["veto_reasons"] if "veto_reasons" in row_keys and x["veto_reasons"] else "NONE",
-                "Regime": x["market_regime"],
-                "SMC": x["smc_score"] if "smc_score" in row_keys else None,
-                "Entry Status": x["entry_status"] if "entry_status" in row_keys else None,
-            })
-
-        st.dataframe(
-            pd.DataFrame(hist_rows),
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
-        st.info(
-            "Belum ada signal tersimpan. "
-            "Gunakan tombol Simpan Signal setelah analisis."
-        )
+        if history:
+            history_rows = []
+            for item in history:
+                keys = item.keys()
+                history_rows.append({
+                    "ID": item["id"],
+                    "Waktu": str(item["created_at"] or "-")[:19].replace("T", " "),
+                    "Pair": item["symbol"],
+                    "Decision": item["final_decision"],
+                    "Confidence": round(float(item["confidence"] or 0)),
+                    "Entry": item["entry"],
+                    "SL": item["stop_loss"],
+                    "TP": item["take_profit"],
+                    "Status": format_signal_history_status(item),
+                    "Raw model": item["raw_model_decision"] if "raw_model_decision" in keys and item["raw_model_decision"] else item["final_decision"],
+                })
+            st.dataframe(pd.DataFrame(history_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("Belum ada sinyal tersimpan. Jalankan scan momentum untuk mulai memantau setup.")
 
     st.caption(
-        "V5.5 adalah sistem riset/paper trading. Tidak mengeksekusi order otomatis. "
+        "Momentum Radar untuk riset dan paper trading. Tidak mengeksekusi order otomatis. "
         "Hasil historis tidak menjamin hasil masa depan."
     )
 
