@@ -1,0 +1,21 @@
+# Generated runtime: keep only the compact source bundle in GitHub.
+.momentum_runtime/
+momentum-radar-full/
+.momentum-export-*/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Local credentials and application state.
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+*.sqlite
+*.sqlite-*
+*.db
+*.log
+.DS_Store
+Thumbs.db
