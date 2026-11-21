@@ -1,0 +1,16 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# PAPER ONLY independent 24/7 worker (no Streamlit dependency)
+ENV PYTHONUNBUFFERED=1
+ENV COINAGENT_REQUIRE_POSTGRES=1
+ENV SCAN_INTERVAL_SECONDS=60
+ENV EARLY_MONITOR_INTERVAL_SECONDS=10
+ENV WORKER_HEARTBEAT_INTERVAL_SECONDS=30
+
+CMD ["python3", "worker.py", "--interval", "60", "--monitor-interval", "10", "--heartbeat-interval", "30", "--candidates", "20", "--shortlist-limit", "50", "--max-groq-candidates", "5"]
